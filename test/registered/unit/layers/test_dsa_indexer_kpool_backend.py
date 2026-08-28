@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    DSATopKBackend,
     TopkTransformMethod,
     _topk_transform_torch,
 )
@@ -15,6 +16,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     _torch_softmax_rotate_quantize,
     topk_from_pooled_history_logits,
 )
+from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,6 +24,104 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestKPoolMqaBackend(CustomTestCase):
+    @staticmethod
+    def _fallback_backend():
+        return SimpleNamespace(
+            dsa_index_kpool=4,
+            dsa_index_topk=8,
+            dsa_topk_backend=DSATopKBackend.TORCH,
+            dsa_prefill_impl="torch",
+            dsa_decode_impl="torch",
+        )
+
+    @staticmethod
+    def _forward_batch(seq_len):
+        return SimpleNamespace(
+            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int32),
+            forward_mode=SimpleNamespace(
+                is_extend_without_speculative=lambda: True,
+                is_decode_or_idle=lambda: False,
+            ),
+        )
+
+    def test_short_torch_fallback_trims_only_empty_kpool_tail(self):
+        backend = self._fallback_backend()
+        indices = torch.tensor(
+            [[0, 1, 2, 3, 4, -1, -1, -1, -1, -1, -1]], dtype=torch.int32
+        )
+
+        result = DeepseekSparseAttnBackend._trim_empty_kpool_tail_for_torch_fallback(
+            backend,
+            indices,
+            "flashinfer_sparse_mla",
+            self._forward_batch(seq_len=5),
+        )
+
+        torch.testing.assert_close(result, indices[:, :8])
+        DeepseekSparseAttnBackend._check_kpool_tail_backend(
+            backend, result, "flashinfer_sparse_mla", "prefill"
+        )
+
+    def test_torch_reference_skips_deep_gemm_schedule_at_long_context(self):
+        backend = self._fallback_backend()
+        self.assertTrue(
+            DeepseekSparseAttnBackend._skip_short_torch_indexer_schedule(
+                backend, self._forward_batch(seq_len=128)
+            )
+        )
+
+    def test_long_torch_fallback_keeps_kpool_backend_guard(self):
+        backend = self._fallback_backend()
+        indices = torch.arange(11, dtype=torch.int32).unsqueeze(0)
+
+        result = DeepseekSparseAttnBackend._trim_empty_kpool_tail_for_torch_fallback(
+            backend,
+            indices,
+            "flashinfer_sparse_mla",
+            self._forward_batch(seq_len=9),
+        )
+
+        self.assertIs(result, indices)
+        with self.assertRaisesRegex(NotImplementedError, "index_kpool > 1"):
+            DeepseekSparseAttnBackend._check_kpool_tail_backend(
+                backend, result, "flashinfer_sparse_mla", "prefill"
+            )
+
+    def test_torch_sparse_mla_matches_direct_attention(self):
+        q = torch.tensor(
+            [[[1.0, 0.0, 0.5], [0.0, 1.0, -0.5]]], dtype=torch.bfloat16
+        )
+        kv = torch.tensor(
+            [[1.0, 0.0, 0.5], [0.0, 1.0, -0.5], [1.0, 1.0, 0.0]],
+            dtype=torch.bfloat16,
+        )
+        indices = torch.tensor([[2, 0, -1]], dtype=torch.int32)
+
+        result = DeepseekSparseAttnBackend._forward_torch_sparse_mla(
+            q_all=q,
+            kv_cache=kv,
+            page_table_1=indices,
+            sm_scale=0.5,
+            v_head_dim=2,
+        )
+
+        selected = kv[[2, 0]].float()
+        scores = torch.einsum("hd,kd->hk", q[0].float(), selected) * 0.5
+        expected = torch.einsum(
+            "hk,kd->hd", torch.softmax(scores, dim=-1), selected[:, :2]
+        ).unsqueeze(0)
+        torch.testing.assert_close(result.float(), expected, atol=5e-3, rtol=5e-3)
+
+    def test_torch_sparse_mla_rejects_empty_index_rows(self):
+        with self.assertRaisesRegex(ValueError, "no valid KV indices"):
+            DeepseekSparseAttnBackend._forward_torch_sparse_mla(
+                q_all=torch.zeros(1, 1, 3),
+                kv_cache=torch.zeros(2, 3),
+                page_table_1=torch.full((1, 2), -1, dtype=torch.int32),
+                sm_scale=1.0,
+                v_head_dim=2,
+            )
+
     def test_torch_paged_topk_returns_physical_slots(self):
         metadata = SimpleNamespace(
             page_table_1=torch.tensor(
@@ -94,6 +194,41 @@ class TestKPoolMqaBackend(CustomTestCase):
         self.assertEqual(quantized.dtype, torch.float8_e4m3fn)
         self.assertTrue(torch.all(scale > 0))
         torch.testing.assert_close(torch.log2(scale), torch.log2(scale).round())
+
+    def test_compact_torch_reference_selects_pools_and_visible_tail(self):
+        indexer = SimpleNamespace(
+            index_kpool=4,
+            index_topk=8,
+            head_dim=2,
+            softmax_scale=2**-0.5,
+            index_kpool_compress_ape=torch.zeros(4, 2),
+        )
+        keys = torch.tensor(
+            [
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [2.0, 2.0],
+            ]
+        )
+        result = dsa_indexer_kpool.IndexerKPool._torch_reference_topk_single(
+            indexer,
+            query=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            keys=keys,
+            gate_scores=torch.zeros_like(keys),
+            head_weights=torch.tensor([1.0, -1.0]),
+        )
+
+        # Pool 0 wins; pool 1 remains because the budget holds both complete
+        # pools, and token 8 is appended as the visible incomplete tail.
+        self.assertEqual(set(result[:8].tolist()), set(range(8)))
+        self.assertEqual(result[8].item(), 8)
+        self.assertTrue(torch.all(result[9:] == -1))
 
     def test_cuda_tilelang_selector_reads_heads_from_unexpanded_query(self):
         with (

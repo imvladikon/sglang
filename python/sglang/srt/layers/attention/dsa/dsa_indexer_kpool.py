@@ -47,7 +47,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -120,6 +120,12 @@ class IndexerKPool(MultiPlatformOp):
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
+
+        # Lazy, non-checkpointed raw state used only by the eager Torch
+        # correctness backend on pre-Hopper development GPUs.  Production
+        # backends keep using the compressed FP8 cache below.
+        self._torch_ref_key_cache = None
+        self._torch_ref_gate_cache = None
 
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
@@ -727,6 +733,160 @@ class IndexerKPool(MultiPlatformOp):
             device=topk_full.device,
         )
         return torch.cat([topk_full, padding], dim=1)
+
+    def _torch_reference_topk_single(
+        self,
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        gate_scores: torch.Tensor,
+        head_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Transformers-equivalent KPool selection for one visible prefix."""
+        seq_len = keys.shape[0]
+        pool_size = self.index_kpool
+        complete_pools = seq_len // pool_size
+        output_width = self.index_topk + pool_size - 1
+
+        if complete_pools:
+            grouped_keys = keys[: complete_pools * pool_size].view(
+                complete_pools, pool_size, self.head_dim
+            )
+            grouped_gate = gate_scores[: complete_pools * pool_size].view(
+                complete_pools, pool_size, self.head_dim
+            )
+            logits = grouped_gate.float() + self.index_kpool_compress_ape.float()
+            probabilities = torch.softmax(logits, dim=1).to(grouped_keys.dtype)
+            pooled_keys = (probabilities * grouped_keys).sum(dim=1)
+
+            per_head_scores = torch.relu(
+                torch.einsum("hd,pd->hp", query.float(), pooled_keys.float())
+                * self.softmax_scale
+            )
+            scores = torch.einsum(
+                "h,hp->p", head_weights.float(), per_head_scores
+            )
+            select_count = min(
+                self.index_topk // pool_size, complete_pools
+            )
+            selected_pools = torch.topk(scores, select_count).indices
+            pool_offsets = torch.arange(pool_size, device=keys.device)
+            selected = (
+                selected_pools[:, None] * pool_size + pool_offsets[None]
+            ).flatten()
+        else:
+            selected = torch.empty(0, dtype=torch.long, device=keys.device)
+
+        tail_count = seq_len % pool_size
+        if tail_count:
+            tail_start = complete_pools * pool_size
+            tail = torch.arange(
+                tail_start, tail_start + tail_count, device=keys.device
+            )
+            selected = torch.cat([selected, tail])
+
+        output = torch.full(
+            (output_width,), -1, dtype=torch.int32, device=keys.device
+        )
+        output[: selected.numel()] = selected.to(torch.int32)
+        return output
+
+    def _forward_cuda_torch_reference(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        forward_batch: ForwardBatch,
+        return_indices: bool,
+        metadata: BaseIndexerMetadata,
+    ) -> Optional[torch.Tensor]:
+        """Exact eager indexer for compact models on GPUs without FP8 E4M3."""
+        if metadata.topk_transform_method != TopkTransformMethod.PAGED:
+            raise NotImplementedError(
+                "Torch KPool reference currently requires PAGED top-k metadata."
+            )
+        if self.dsa_enable_prefill_cp:
+            raise NotImplementedError("Torch KPool reference does not support CP.")
+
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+        key, _ = self.wk(x)
+        key = self.k_norm(key)
+        gate = F.linear(x, self.index_kpool_compress_gate)
+        head_weights, _ = self.weights_proj(x.float())
+        head_weights = head_weights.float() * (self.n_heads**-0.5)
+
+        pool = get_token_to_kv_pool()
+        capacity = pool.size + pool.page_size
+        if (
+            self._torch_ref_key_cache is None
+            or self._torch_ref_key_cache.shape[0] != capacity
+            or self._torch_ref_key_cache.device != key.device
+        ):
+            self._torch_ref_key_cache = torch.zeros(
+                capacity, self.head_dim, dtype=key.dtype, device=key.device
+            )
+            self._torch_ref_gate_cache = torch.zeros(
+                capacity, self.head_dim, dtype=gate.dtype, device=gate.device
+            )
+
+        write_locs = forward_batch.out_cache_loc[: key.shape[0]].to(torch.long)
+        valid_writes = write_locs >= 0
+        self._torch_ref_key_cache.index_copy_(
+            0, write_locs[valid_writes], key[valid_writes]
+        )
+        self._torch_ref_gate_cache.index_copy_(
+            0, write_locs[valid_writes], gate[valid_writes]
+        )
+        if not return_indices:
+            return None
+
+        assert forward_batch.seq_lens_cpu is not None
+        req_table = get_req_to_token_pool().req_to_token
+        rows = []
+        q_offset = 0
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            assert forward_batch.extend_seq_lens_cpu is not None
+            per_request_q_lens = forward_batch.extend_seq_lens_cpu
+        elif forward_batch.forward_mode.is_decode_or_idle():
+            per_request_q_lens = [1] * forward_batch.batch_size
+        else:
+            raise NotImplementedError(
+                "Torch KPool reference supports eager extend and decode only."
+            )
+
+        for batch_idx, q_len in enumerate(per_request_q_lens):
+            q_len = int(q_len)
+            if q_len == 0:
+                continue
+            seq_len = int(forward_batch.seq_lens_cpu[batch_idx].item())
+            prefix_len = seq_len - q_len
+            req_idx = int(forward_batch.req_pool_indices[batch_idx].item())
+            for local_q in range(q_len):
+                visible_len = prefix_len + local_q + 1
+                slots = req_table[req_idx, :visible_len].to(torch.long)
+                logical = self._torch_reference_topk_single(
+                    query=query[q_offset + local_q],
+                    keys=self._torch_ref_key_cache.index_select(0, slots),
+                    gate_scores=self._torch_ref_gate_cache.index_select(0, slots),
+                    head_weights=head_weights[q_offset + local_q],
+                )
+                if envs.SGLANG_DSA_FUSE_TOPK.get():
+                    valid = logical >= 0
+                    physical = logical.clone()
+                    physical[valid] = slots.index_select(
+                        0, logical[valid].to(torch.long)
+                    ).to(torch.int32)
+                    logical = physical
+                rows.append(logical)
+            q_offset += q_len
+
+        if not rows:
+            return torch.full(
+                (x.shape[0], self.index_topk + self.index_kpool - 1),
+                -1,
+                dtype=torch.int32,
+                device=x.device,
+            )
+        return torch.stack(rows)
 
     def _topk_from_kpool_logits(
         self,
@@ -1649,6 +1809,20 @@ class IndexerKPool(MultiPlatformOp):
                 -1,
                 dtype=torch.int,
                 device=x.device,
+            )
+
+        reference_attention_backend = (
+            get_exec().kernel.dsa_prefill_backend
+            if mode.is_extend_without_speculative()
+            else get_exec().kernel.dsa_decode_backend
+        )
+        if metadata.topk_backend.is_torch() and reference_attention_backend == "torch":
+            return self._forward_cuda_torch_reference(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                return_indices=return_indices,
+                metadata=metadata,
             )
 
         if (

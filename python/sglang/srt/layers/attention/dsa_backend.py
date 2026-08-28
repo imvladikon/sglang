@@ -418,6 +418,7 @@ class _DSAInGraphVerifyMetadataState:
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
+    "torch",
     "flashmla_sparse",
     "flashmla_sparse_q8",
     "flashmla_kv",
@@ -875,7 +876,8 @@ class DeepseekSparseAttnBackend(
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or topk_indices.shape[-1] <= self.dsa_index_topk
+            or dsa_impl in ("torch", "fa3", "tilelang", "trtllm")
         ):
             return
         raise NotImplementedError(
@@ -883,6 +885,43 @@ class DeepseekSparseAttnBackend(
             f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
             "backend."
         )
+
+    def _trim_empty_kpool_tail_for_torch_fallback(
+        self,
+        topk_indices: Optional[torch.Tensor],
+        dsa_impl: _DSA_IMPL_T,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        """Drop placeholder tail slots from the eager short-context path.
+
+        KPool's exact select-all path already includes every live token in the
+        regular ``index_topk`` columns and appends ``index_kpool - 1`` values of
+        ``-1`` only to preserve the production kernel shape.  Backends without
+        KPool-tail support can therefore consume the regular columns exactly,
+        but only while the whole live context fits inside ``index_topk``.
+        """
+        if (
+            topk_indices is None
+            or self.dsa_index_kpool <= 1
+            or dsa_impl in ("torch", "fa3", "tilelang", "trtllm")
+            or not self.dsa_topk_backend.is_torch()
+            or not (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                or forward_batch.forward_mode.is_decode_or_idle()
+            )
+        ):
+            return topk_indices
+
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        expected_width = self.dsa_index_topk + self.dsa_index_kpool - 1
+        if (
+            seq_lens_cpu is not None
+            and seq_lens_cpu.numel() > 0
+            and int(seq_lens_cpu.max().item()) <= self.dsa_index_topk
+            and topk_indices.shape[-1] == expected_width
+        ):
+            return topk_indices[..., : self.dsa_index_topk]
+        return topk_indices
 
     def _resolve_kpool_tail_backend(
         self,
@@ -1033,16 +1072,24 @@ class DeepseekSparseAttnBackend(
     def _skip_short_torch_indexer_schedule(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        """Whether eager short-context DSA will take the exact select-all path."""
+        """Whether Torch DSA can skip the production DeepGEMM schedule."""
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        return (
-            self.dsa_topk_backend.is_torch()
-            and self.dsa_index_kpool > 1
-            and forward_batch.forward_mode.is_decode_or_idle()
-            and seq_lens_cpu is not None
-            and seq_lens_cpu.numel() > 0
-            and int(seq_lens_cpu.max().item()) <= self.dsa_index_topk
-        )
+        if not self.dsa_topk_backend.is_torch() or self.dsa_index_kpool <= 1:
+            return False
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and self.dsa_prefill_impl == "torch"
+        ):
+            return True
+        if forward_batch.forward_mode.is_decode_or_idle():
+            if self.dsa_decode_impl == "torch":
+                return True
+            return (
+                seq_lens_cpu is not None
+                and seq_lens_cpu.numel() > 0
+                and int(seq_lens_cpu.max().item()) <= self.dsa_index_topk
+            )
+        return False
 
     def _init_kpool_metadata(
         self,
@@ -3097,6 +3144,9 @@ class DeepseekSparseAttnBackend(
             else "prefill"
         )
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
+        topk_indices = self._trim_empty_kpool_tail_for_torch_fallback(
+            topk_indices, dsa_impl, forward_batch
+        )
         self._check_kpool_tail_backend(topk_indices, dsa_impl, phase)
 
         if dsa_impl == "trtllm" and not self.use_mha:
@@ -3211,7 +3261,17 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
-        if dsa_impl == "tilelang":
+        if dsa_impl == "torch":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_torch_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif dsa_impl == "tilelang":
             if q_rope is not None:
                 # Triton prefill kernel reads q_nope/q_rope directly, skipping
                 # the concat (it splits q into main/tail internally anyway).
@@ -3426,6 +3486,9 @@ class DeepseekSparseAttnBackend(
         assert causal, "DSA is causal only"
 
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
+        topk_indices = self._trim_empty_kpool_tail_for_torch_fallback(
+            topk_indices, dsa_impl, forward_batch
+        )
         self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
 
         if dsa_impl == "trtllm":
@@ -3500,7 +3563,17 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        if dsa_impl == "flashmla_sparse":
+        if dsa_impl == "torch":
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_torch_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
@@ -4031,6 +4104,45 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
+
+    @staticmethod
+    def _forward_torch_sparse_mla(
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """Exact eager sparse-MLA reference for compact development models."""
+        if page_table_1.ndim != 2 or page_table_1.shape[0] != q_all.shape[0]:
+            raise ValueError(
+                "Torch DSA expects one sparse index row per query token, got "
+                f"q={tuple(q_all.shape)} and indices={tuple(page_table_1.shape)}."
+            )
+
+        flat_kv = kv_cache.reshape(-1, kv_cache.shape[-1])
+        valid = page_table_1 >= 0
+        if not torch.all(valid.any(dim=-1)):
+            raise ValueError("Torch DSA received a query with no valid KV indices.")
+        safe_indices = torch.where(
+            valid, page_table_1, torch.zeros_like(page_table_1)
+        ).to(torch.long)
+        if torch.any(safe_indices >= flat_kv.shape[0]):
+            raise IndexError(
+                "Torch DSA sparse index exceeds the flattened KV cache capacity."
+            )
+
+        selected_kv = flat_kv.index_select(0, safe_indices.reshape(-1)).view(
+            *safe_indices.shape, flat_kv.shape[-1]
+        )
+        q_float = q_all.float()
+        k_float = selected_kv.float()
+        scores = torch.einsum("thd,tkd->thk", q_float, k_float) * sm_scale
+        scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        values = k_float[..., :v_head_dim]
+        output = torch.einsum("thk,tkd->thd", probs, values)
+        return output.to(q_all.dtype)
 
     def _forward_flashmla_kv(
         self,

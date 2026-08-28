@@ -2003,6 +2003,14 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = default
         if not user_set_decode:
             declared["dsa_decode_backend"] = default
+    elif major < 9:
+        # Sparse CUDA kernels require Hopper or newer.  Keep an exact eager
+        # reference path for correctness tests and compact development models
+        # on Ampere rather than selecting a binary that cannot launch.
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "torch"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "torch"
     else:
         # Set prefill/decode backends based on hardware architecture.
         if not user_set_prefill:

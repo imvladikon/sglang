@@ -375,6 +375,7 @@ PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 DSA_CHOICES = [
+    "torch",
     "flashmla_sparse",
     "flashmla_sparse_q8",
     "flashmla_kv",
