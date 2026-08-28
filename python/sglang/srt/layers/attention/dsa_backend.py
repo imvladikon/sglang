@@ -985,6 +985,7 @@ class DeepseekSparseAttnBackend(
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
             self.dsa_topk_backend.is_sgl_kernel()
+            or self.dsa_topk_backend.is_torch()
             or self.dsa_topk_backend.is_flashinfer()
         ):
             return topk_indices
@@ -1029,6 +1030,20 @@ class DeepseekSparseAttnBackend(
             return self.num_q_heads in (32, 64)
         return True
 
+    def _skip_short_torch_indexer_schedule(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        """Whether eager short-context DSA will take the exact select-all path."""
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        return (
+            self.dsa_topk_backend.is_torch()
+            and self.dsa_index_kpool > 1
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and seq_lens_cpu is not None
+            and seq_lens_cpu.numel() > 0
+            and int(seq_lens_cpu.max().item()) <= self.dsa_index_topk
+        )
+
     def _init_kpool_metadata(
         self,
         metadata: DSAMetadata,
@@ -1041,7 +1056,10 @@ class DeepseekSparseAttnBackend(
 
         forward_mode = forward_batch.forward_mode
         slots_per_page = self._kpool_slots_per_page()
-        build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
+        build_schedule_metadata = (
+            self._build_kpool_paged_mqa_schedule_metadata()
+            and not self._skip_short_torch_indexer_schedule(forward_batch)
+        )
         if forward_mode.is_extend_without_speculative():
             assert topk_transform_method is not None
             assert kpool_inputs is not None
@@ -1668,7 +1686,9 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
+        if is_cuda() and not self._skip_short_torch_indexer_schedule(
+            forward_batch
+        ) and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()

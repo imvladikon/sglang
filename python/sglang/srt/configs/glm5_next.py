@@ -196,33 +196,37 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.gate_lower_bound = (
             gate_lower_bound if gate_lower_bound is not None else linear_lower_bound
         )
+        layer_types = kwargs.get("layer_types")
+        if layer_types is None:
+            kda_layers = [
+                layer_idx
+                for layer_idx in range(num_hidden_layers)
+                if layer_idx % 4 != 3
+            ]
+        else:
+            kda_layers = [
+                layer_idx
+                for layer_idx, layer_type in enumerate(layer_types)
+                if layer_type == "linear_attention"
+            ]
+        kda_layer_set = set(kda_layers)
         if linear_attn_config is None:
-            layer_types = kwargs.get("layer_types")
-            if layer_types is None:
-                kda_layers = [
-                    layer_idx
-                    for layer_idx in range(num_hidden_layers)
-                    if layer_idx % 4 != 3
-                ]
-            else:
-                kda_layers = [
-                    layer_idx
-                    for layer_idx, layer_type in enumerate(layer_types)
-                    if layer_type == "linear_attention"
-                ]
-            kda_layer_set = set(kda_layers)
-            linear_attn_config = {
-                "full_attn_layers": [
-                    layer_idx
-                    for layer_idx in range(num_hidden_layers)
-                    if layer_idx not in kda_layer_set
-                ],
-                "head_dim": linear_head_dim,
-                "kda_layers": kda_layers,
-                "num_heads": linear_num_heads,
-                "short_conv_kernel_size": linear_conv_kernel_dim,
-                "gate_lower_bound": self.gate_lower_bound,
-            }
+            linear_attn_config = {}
+        linear_attn_config.setdefault("kda_layers", kda_layers)
+        linear_attn_config.setdefault(
+            "full_attn_layers",
+            [
+                layer_idx
+                for layer_idx in range(num_hidden_layers)
+                if layer_idx not in kda_layer_set
+            ],
+        )
+        linear_attn_config.setdefault("head_dim", linear_head_dim)
+        linear_attn_config.setdefault("num_heads", linear_num_heads)
+        linear_attn_config.setdefault(
+            "short_conv_kernel_size", linear_conv_kernel_dim
+        )
+        linear_attn_config.setdefault("gate_lower_bound", self.gate_lower_bound)
         self.linear_attn_config = linear_attn_config
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk

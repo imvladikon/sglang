@@ -4805,8 +4805,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
-        # num head == 1 and head dim == 128 for index_k in DSA
-        assert index_head_dim == 128
+        # The production checkpoints use one 128-wide FP8 quantization group.
+        # Compact architecture-contract models may reduce the index head while
+        # preserving the same one-group cache layout.  Keep the production path
+        # unchanged and size that single group to the compact head instead of
+        # silently padding/lying about the model configuration.
+        assert 0 < index_head_dim <= 128 and index_head_dim & (index_head_dim - 1) == 0, (
+            "DSA index_head_dim must be a power of two in [1, 128], got "
+            f"{index_head_dim}"
+        )
+        self.quant_block_size = index_head_dim
 
         self.skip_topk_layers = (
             list(skip_topk_layers)

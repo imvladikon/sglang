@@ -83,7 +83,7 @@ class GetK:
         flat_indices = flat_indices.flatten()[: seq_len * num_k_bytes_per_token]
 
         out = flat_buf[flat_indices]
-        return out.view(-1, 128)
+        return out.view(-1, pool.index_head_dim)
 
     @classmethod
     def triton(
@@ -302,10 +302,12 @@ def _set_k_and_s_triton(
         raise ValueError(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
-    assert buf_numel_per_page == page_size * (128 + 4)
+    assert scale_dim == 1, (
+        "DSA index cache currently supports one FP8 quantization group per key, "
+        f"got {scale_dim} groups for head dim {index_head_dim}"
+    )
+    assert buf_numel_per_page == page_size * (index_head_dim + scale_dim * 4)
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
-    assert index_head_dim == 128
-    assert scale_dim == 1
     if _is_hip:
         if _use_aiter_preshuffle:
             assert (

@@ -1,13 +1,18 @@
 import sys
 import unittest
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    TopkTransformMethod,
+    _topk_transform_torch,
+)
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     _topk_from_pooled_history_logits_unfused,
+    _torch_hadamard_index_head,
+    _torch_softmax_rotate_quantize,
     topk_from_pooled_history_logits,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,6 +22,79 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestKPoolMqaBackend(CustomTestCase):
+    def test_torch_paged_topk_returns_physical_slots(self):
+        metadata = SimpleNamespace(
+            page_table_1=torch.tensor(
+                [[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32
+            )
+        )
+        result = _topk_transform_torch(
+            logits=torch.tensor(
+                [[0.1, 0.9, 0.8, 50.0], [0.7, 0.6, 50.0, 40.0]],
+                dtype=torch.float32,
+            ),
+            lengths=torch.tensor([3, 2], dtype=torch.int32),
+            topk=3,
+            topk_transform_method=TopkTransformMethod.PAGED,
+            attn_metadata=metadata,
+            cu_seqlens_q_topk=None,
+            topk_indices_offset=None,
+            row_starts=None,
+            batch_idx_list=None,
+        )
+
+        torch.testing.assert_close(
+            result,
+            torch.tensor([[11, 12, 10], [20, 21, -1]], dtype=torch.int32),
+        )
+
+    def test_torch_ragged_topk_applies_row_relative_offsets(self):
+        result = _topk_transform_torch(
+            logits=torch.tensor([[50.0, 0.2, 0.8, 40.0]], dtype=torch.float32),
+            lengths=torch.tensor([2], dtype=torch.int32),
+            topk=3,
+            topk_transform_method=TopkTransformMethod.RAGGED,
+            attn_metadata=SimpleNamespace(),
+            cu_seqlens_q_topk=None,
+            topk_indices_offset=torch.tensor([100], dtype=torch.int32),
+            row_starts=torch.tensor([1], dtype=torch.int32),
+            batch_idx_list=None,
+        )
+
+        torch.testing.assert_close(
+            result,
+            torch.tensor([[101, 100, -1]], dtype=torch.int32),
+        )
+
+    def test_compact_hadamard_is_orthonormal(self):
+        identity = torch.eye(64, dtype=torch.float32)
+        rotated = _torch_hadamard_index_head(identity)
+
+        torch.testing.assert_close(rotated @ rotated.T, identity)
+
+    def test_reference_kpool_quantization_supports_compact_head(self):
+        slot_k = torch.arange(2 * 4 * 64, dtype=torch.float32).reshape(2, 4, 64)
+        slot_score = (
+            torch.tensor(
+                [[0.0, 1.0, 2.0, 3.0], [3.0, 2.0, 1.0, 0.0]], dtype=torch.float32
+            )
+            .unsqueeze(-1)
+            .expand_as(slot_k)
+        )
+        ape = torch.zeros(4, 64, dtype=torch.float32)
+
+        quantized, scale = _torch_softmax_rotate_quantize(
+            slot_k=slot_k,
+            slot_score=slot_score,
+            ape=ape,
+            round_scale=True,
+        )
+
+        self.assertEqual(quantized.shape, (2, 64))
+        self.assertEqual(quantized.dtype, torch.float8_e4m3fn)
+        self.assertTrue(torch.all(scale > 0))
+        torch.testing.assert_close(torch.log2(scale), torch.log2(scale).round())
+
     def test_cuda_tilelang_selector_reads_heads_from_unexpanded_query(self):
         with (
             patch.object(dsa_indexer_kpool, "is_cuda", return_value=True),

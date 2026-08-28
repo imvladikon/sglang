@@ -8,14 +8,16 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-    INDEX_HEAD_DIM,
     build_pooled_page_table_64,
     kpool_build_ragged_layout,
     kpool_max_closed_pools,
     update_kpool_write_plan_cuda_graph,
 )
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda
 
@@ -30,7 +32,7 @@ _RAGGED_SCRATCH_K_SCALE: Optional[torch.Tensor] = None
 
 
 def _get_ragged_scratch(
-    total_k_rows: int, device: torch.device
+    total_k_rows: int, index_head_dim: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     global _RAGGED_SCRATCH_K_U8, _RAGGED_SCRATCH_K_SCALE
     cur = _RAGGED_SCRATCH_K_U8
@@ -39,10 +41,11 @@ def _get_ragged_scratch(
         or cur.device.type != device.type
         or (device.index is not None and cur.device.index != device.index)
         or cur.shape[0] < total_k_rows
+        or cur.shape[1] != index_head_dim
     )
     if grow:
         _RAGGED_SCRATCH_K_U8 = torch.empty(
-            (total_k_rows, INDEX_HEAD_DIM), dtype=torch.uint8, device=device
+            (total_k_rows, index_head_dim), dtype=torch.uint8, device=device
         )
         _RAGGED_SCRATCH_K_SCALE = torch.empty(
             (total_k_rows,), dtype=torch.float32, device=device
@@ -420,7 +423,11 @@ def _kpool_plan_to_gpu(
         ragged_paged_page_table = req_to_token
 
     if ragged_total_k_rows > 0:
-        ragged_k_u8, ragged_k_scale = _get_ragged_scratch(ragged_total_k_rows, device)
+        ragged_k_u8, ragged_k_scale = _get_ragged_scratch(
+            ragged_total_k_rows,
+            get_token_to_kv_pool().index_head_dim,
+            device,
+        )
     else:
         ragged_k_u8 = None
         ragged_k_scale = None

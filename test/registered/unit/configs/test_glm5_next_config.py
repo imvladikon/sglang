@@ -61,6 +61,28 @@ class TestGlm5NextTextConfig(CustomTestCase):
 
         self.assertIsNone(config.linear_attn_config["gate_lower_bound"])
 
+    def test_transformers_compact_linear_attention_config_is_normalized(self):
+        config = Glm5NextTextConfig(
+            num_hidden_layers=5,
+            layer_types=[
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "deepseek_sparse_attention",
+                "linear_attention",
+            ],
+            linear_attn_config={
+                "head_dim": 64,
+                "num_heads": 4,
+                "short_conv_kernel_size": 4,
+                "gate_lower_bound": -5.0,
+            },
+        )
+
+        self.assertEqual(config.linear_attn_config["kda_layers"], [0, 1, 2, 4])
+        self.assertEqual(config.linear_attn_config["full_attn_layers"], [3])
+        self.assertEqual(config.linear_attn_config["head_dim"], 64)
+
     def test_legacy_linear_lower_bound_is_normalized(self):
         config = Glm5NextTextConfig(
             num_hidden_layers=2,

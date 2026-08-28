@@ -1799,6 +1799,26 @@ def _mhc_pre_dispatch(
         )
         return post_mix, comb_mix, layer_input, False
 
+    # The optimized split-K TileLang pre-kernel is specialized for the two
+    # released production widths.  Architecture-contract checkpoints retain
+    # the exact mHC equations while shrinking n*hidden (for example 4*256).
+    # Use the existing reference implementation for those widths instead of
+    # padding the checkpoint or pretending that its hidden size is larger.
+    hc_hidden_size = residual.shape[-2] * residual.shape[-1]
+    if hc_hidden_size not in (16384, 28672):
+        post_mix, comb_mix, layer_input = _mhc_pre_torch(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+        return post_mix, comb_mix, layer_input, False
+
     post_mix, comb_mix, layer_input = mhc_pre(
         residual=residual,
         fn=fn,

@@ -1863,7 +1863,11 @@ class DeepseekV2AttentionMLA(
                     max_position_embeddings=max_position_embeddings,
                     rope_theta=rope_theta,
                     scale_fmt="ue8m0",
-                    block_size=128,
+                    # Production DSA uses 128-wide FP8 groups.  Compact
+                    # architecture-contract checkpoints may shrink the index
+                    # head; retain one quantization group without padding the
+                    # checkpoint or changing its model math.
+                    block_size=min(128, get_dsa_index_head_dim(config)),
                     rope_scaling=rope_scaling,
                     is_neox_style=is_neox_style,
                     prefix=add_prefix("indexer", prefix),

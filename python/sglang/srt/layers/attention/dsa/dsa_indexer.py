@@ -605,6 +605,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None
+            and pool.index_head_dim == 128
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
             fused_k_indexer_norm_rope_store(
@@ -1543,6 +1544,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
+            and pool.index_head_dim == 128
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,

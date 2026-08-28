@@ -1513,7 +1513,10 @@ class IndexerKPool(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.forward_mode.is_decode_or_idle()
+        )
 
         key = self._get_k_bf16(x, positions)
         self._compress_write(
@@ -1664,12 +1667,19 @@ class IndexerKPool(MultiPlatformOp):
                 return_indices=return_indices,
             )
 
-        # CUDA graph capture keeps the full topk path; the skip branch is extend-only.
+        # CUDA graph capture keeps the full topk path.  In eager mode, both
+        # extend and decode can use the exact select-all result while the live
+        # context fits inside index_topk.
         skip_logits_computation = False
-        if forward_batch.forward_mode.is_extend_without_speculative():
-            if forward_batch.seq_lens_cpu is not None:
-                max_kv_len = forward_batch.seq_lens_cpu.max().item()
-                skip_logits_computation = max_kv_len <= self.index_topk
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and not get_is_capture_mode()
+            )
+        ):
+            max_kv_len = forward_batch.seq_lens_cpu.max().item()
+            skip_logits_computation = max_kv_len <= self.index_topk
 
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
             return self._forward_cuda_skip_logits(
