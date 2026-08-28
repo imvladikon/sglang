@@ -3394,7 +3394,8 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+if not hasattr(triton, "next_power_of_2"):
+    triton.next_power_of_2 = next_power_of_2
 
 
 class EmptyContextManager:
