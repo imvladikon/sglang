@@ -27,11 +27,10 @@ use crate::{
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        generate::GenerateRequest,
         rerank::RerankRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{GenerateRequestWithExtensions, RouterTrait},
     server::ServerConfig,
 };
 
@@ -494,7 +493,7 @@ impl RouterTrait for RouterManager {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
+        body: &GenerateRequestWithExtensions,
         model_id: Option<&str>,
     ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
