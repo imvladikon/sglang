@@ -70,43 +70,57 @@ class WeightChecker:
         self._ps = ps
         self._snapshot_tensors = None
 
-    def handle(self, action: str, allow_quant_error: bool = False) -> Optional[Dict]:
+    def handle(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_prefixes: Iterable[str] = (),
+    ) -> Optional[Dict]:
+        skip_prefixes = tuple(skip_prefixes)
         logger.info(
-            f"[WeightChecker] handle action={action} allow_quant_error={allow_quant_error}"
+            f"[WeightChecker] handle action={action} allow_quant_error={allow_quant_error} "
+            f"skip_prefixes={skip_prefixes}"
         )
         if action == "snapshot":
-            return self._snapshot()
+            return self._snapshot(skip_prefixes=skip_prefixes)
         elif action == "reset_tensors":
-            return self._reset_tensors()
+            return self._reset_tensors(skip_prefixes=skip_prefixes)
         elif action == "compare":
-            return self._compare(allow_quant_error=allow_quant_error)
+            return self._compare(
+                allow_quant_error=allow_quant_error, skip_prefixes=skip_prefixes
+            )
         elif action == "checksum":
-            return self._compute_checksum()
+            return self._compute_checksum(skip_prefixes=skip_prefixes)
         else:
             raise Exception(f"Unsupported {action=}")
 
-    def _snapshot(self):
+    def _snapshot(self, skip_prefixes: Iterable[str] = ()):
         named_tensors = [
-            (name, param.data.detach().cpu()) for name, param in self._model_state()
+            (name, param.data.detach().cpu())
+            for name, param in self._model_state(skip_prefixes=skip_prefixes)
         ]
         self._snapshot_tensors = dict(named_tensors)
         assert len(self._snapshot_tensors) == len(
             named_tensors
         ), f"should not have duplicated tensor name"
 
-    def _reset_tensors(self):
-        for name, param in self._model_state():
+    def _reset_tensors(self, skip_prefixes: Iterable[str] = ()):
+        for name, param in self._model_state(skip_prefixes=skip_prefixes):
             if _is_non_persistent_buffer_name(name):
                 continue
             param.copy_(_random_like(param))
 
-    def _compare(self, allow_quant_error: bool = False):
+    def _compare(
+        self,
+        allow_quant_error: bool = False,
+        skip_prefixes: Iterable[str] = (),
+    ):
         assert self._snapshot_tensors is not None
 
         quantized_set = _build_quantized_set(self._get_model())
         skip_compare_names = {
             name
-            for name, param in self._model_state()
+            for name, param in self._model_state(skip_prefixes=skip_prefixes)
             if getattr(param, "_skip_weight_check", False)
         }
         _check_tensors(
@@ -114,19 +128,21 @@ class WeightChecker:
                 self._snapshot_tensors, skip_compare_names, quantized_set
             ),
             actual_tensors=_build_check_entries(
-                dict(self._model_state()), skip_compare_names, quantized_set
+                dict(self._model_state(skip_prefixes=skip_prefixes)),
+                skip_compare_names,
+                quantized_set,
             ),
             allow_quant_error=allow_quant_error,
         )
 
-    def _compute_checksum(self) -> Dict:
+    def _compute_checksum(self, skip_prefixes: Iterable[str] = ()) -> Dict:
         torch.cuda.synchronize()
         start = time.perf_counter()
 
         quantized_set = _build_quantized_set(self._get_model())
         skip_compare_names = {
             name
-            for name, param in self._model_state()
+            for name, param in self._model_state(skip_prefixes=skip_prefixes)
             if getattr(param, "_skip_weight_check", False)
         }
 
@@ -134,7 +150,9 @@ class WeightChecker:
         # bf16 hash equal.
         checksums = {}
         for name, should_compare, comparable in _build_check_entries(
-            dict(self._model_state()), skip_compare_names, quantized_set
+            dict(self._model_state(skip_prefixes=skip_prefixes)),
+            skip_compare_names,
+            quantized_set,
         ):
             if should_compare:
                 checksums[name] = _hash_tensor(comparable.dequantize().data)
@@ -171,10 +189,15 @@ class WeightChecker:
             size=dist.get_world_size() if dist.is_initialized() else 1,
         )
 
-    def _model_state(self):
+    def _model_state(self, skip_prefixes: Iterable[str] = ()):
+        skip_prefixes = tuple(skip_prefixes)
         model = self._get_model()
-        yield from model.named_parameters()
-        yield from model.named_buffers()
+        for name, tensor in model.named_parameters():
+            if not name.startswith(skip_prefixes):
+                yield name, tensor
+        for name, tensor in model.named_buffers():
+            if not name.startswith(skip_prefixes):
+                yield name, tensor
 
 
 def _hash_tensor(t: torch.Tensor) -> str:

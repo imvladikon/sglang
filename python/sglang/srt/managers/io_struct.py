@@ -1966,6 +1966,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False
+    skip_prefixes: Optional[List[str]] = None
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in

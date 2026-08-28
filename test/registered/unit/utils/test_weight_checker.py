@@ -592,6 +592,20 @@ class TestCompare(_WeightCheckerTestBase):
 
 class TestHandle(_WeightCheckerTestBase):
 
+    def test_skip_prefixes_scope_the_full_check_lifecycle(self):
+        self.checker.handle("snapshot", skip_prefixes=("b",))
+        before_b = self.model.b.clone()
+        before_w = self.model.w.clone()
+
+        self.checker.handle("reset_tensors", skip_prefixes=("b",))
+
+        torch.testing.assert_close(self.model.b, before_b)
+        self.assertFalse(torch.equal(self.model.w, before_w))
+        with torch.no_grad():
+            self.model.w.copy_(before_w)
+            self.model.running_mean.zero_()
+        self.checker.handle("compare", skip_prefixes=("b",))
+
     def test_routes_to_actions(self):
         with (
             patch.object(self.checker, "_snapshot") as m_snap,
