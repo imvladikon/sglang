@@ -206,6 +206,8 @@ pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
 }
 
+_TILELANG_MHC_HC_HIDDEN_SIZES = frozenset((16384, 28672))
+
 
 def _use_deep_gemm_hc_prenorm() -> bool:
     if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
@@ -1805,7 +1807,7 @@ def _mhc_pre_dispatch(
     # Use the existing reference implementation for those widths instead of
     # padding the checkpoint or pretending that its hidden size is larger.
     hc_hidden_size = residual.shape[-2] * residual.shape[-1]
-    if hc_hidden_size not in (16384, 28672):
+    if hc_hidden_size not in _TILELANG_MHC_HC_HIDDEN_SIZES:
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -1855,6 +1857,13 @@ def _mhc_post_dispatch(
             return result
 
     if not _use_tilelang_mhc_post():
+        return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+
+    # Keep the post boundary paired with the pre-boundary policy above.  The
+    # TileLang kernel is tuned for released production widths; compact
+    # architecture-contract checkpoints use the exact torch equation instead.
+    hc_hidden_size = residual.shape[-2] * residual.shape[-1]
+    if hc_hidden_size not in _TILELANG_MHC_HC_HIDDEN_SIZES:
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 

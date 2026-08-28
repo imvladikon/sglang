@@ -127,6 +127,42 @@ def test_aiter_mhc_post_dispatch_uses_preallocated_output():
     torch.testing.assert_close(actual, residual + 1)
 
 
+def test_compact_mhc_post_dispatch_uses_torch_reference():
+    x = torch.randn(2, 8)
+    residual = torch.randn(2, 4, 8)
+    post = torch.randn(2, 4, 1)
+    comb = torch.randn(2, 4, 4)
+    expected = mhc._mhc_post_torch(x, residual, post, comb)
+
+    with (
+        patch.object(mhc, "_use_aiter_mhc", return_value=False),
+        patch.object(mhc, "_use_tilelang_mhc_post", return_value=True),
+        patch.object(mhc, "mhc_post") as tilelang_post,
+    ):
+        actual = mhc._mhc_post_dispatch(x, residual, post, comb)
+
+    torch.testing.assert_close(actual, expected)
+    tilelang_post.assert_not_called()
+
+
+def test_production_mhc_post_dispatch_preserves_tilelang_path():
+    x = torch.randn(1, 4096)
+    residual = torch.randn(1, 4, 4096)
+    post = torch.randn(1, 4, 1)
+    comb = torch.randn(1, 4, 4)
+    expected = torch.randn_like(residual)
+
+    with (
+        patch.object(mhc, "_use_aiter_mhc", return_value=False),
+        patch.object(mhc, "_use_tilelang_mhc_post", return_value=True),
+        patch.object(mhc, "mhc_post", return_value=expected) as tilelang_post,
+    ):
+        actual = mhc._mhc_post_dispatch(x, residual, post, comb)
+
+    assert actual is expected
+    tilelang_post.assert_called_once_with(x, residual, post, comb)
+
+
 class _AddOneNorm(nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
