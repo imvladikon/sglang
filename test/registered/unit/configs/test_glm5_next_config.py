@@ -2,6 +2,8 @@
 
 import unittest
 
+from transformers import AutoConfig
+
 from sglang.srt.configs.glm5_next import Glm5NextTextConfig
 from sglang.srt.configs.mamba_utils import KimiLinearStateShape
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -11,6 +13,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestGlm5NextTextConfig(CustomTestCase):
+    def test_pinned_transformers_registers_glm5_next(self):
+        config = AutoConfig.for_model("glm5_next")
+
+        self.assertEqual(config.model_type, "glm5_next")
+
     def test_kimi_linear_state_shape_preserves_channel_slice_axis(self):
         shape = KimiLinearStateShape.create(
             tp_world_size=8,
