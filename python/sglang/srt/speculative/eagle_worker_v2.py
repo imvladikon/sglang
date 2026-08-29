@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import List, Optional
 
 import torch
+
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.distributed import get_pp_group
