@@ -4679,6 +4679,7 @@ class ServerArgs:
             default=argparse.SUPPRESS,
             type=str,
             choices=[
+                "torch",
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
                 "flashmla_kv",
@@ -4699,6 +4700,7 @@ class ServerArgs:
             default=argparse.SUPPRESS,
             type=str,
             choices=[
+                "torch",
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
                 "flashmla_kv",
