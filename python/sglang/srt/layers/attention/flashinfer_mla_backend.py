@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from sglang.srt.runtime_context import (
+    get_buffer,
     get_disagg,
     get_exec,
     get_parallel,
+    get_platform,
     get_schedule,
 )
 
@@ -42,7 +44,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_buffer
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -51,8 +52,6 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import (
     is_flashinfer_available,
-    is_sm90_supported,
-    is_sm100_supported,
     next_power_of_2,
 )
 
@@ -339,7 +338,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        if is_sm100_supported():
+        if get_platform().is_sm100:
             self.fmha_backend = "cutlass"
         else:
             self.fmha_backend = "auto"
@@ -350,7 +349,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         self.decode_bf16_kv_indices = None
         self.extend_bf16_kv_indices = None
-        self.decode_fp8_native = is_sm90_supported()
+        self.decode_fp8_native = get_platform().is_sm90
 
         if not self.skip_prefill:
             self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(

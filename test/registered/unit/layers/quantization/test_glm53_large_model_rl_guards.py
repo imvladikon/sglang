@@ -28,6 +28,37 @@ class _Activation:
 
 
 class TestGlm53LargeModelRlGuards(CustomTestCase):
+    def test_glm53_keeps_deepseek_dsa_family_defaults_after_override_split(self):
+        from sglang.srt.arg_groups.model_override_base import _MODEL_OVERRIDE_FNS
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
+
+        architecture = "Glm5NextForConditionalGeneration"
+        self.assertIn(_deepseek_family_overrides, _MODEL_OVERRIDE_FNS[architecture])
+
+        args = SimpleNamespace(
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            enable_prefill_cp=False,
+        )
+        platform = SimpleNamespace(is_npu=False, is_xpu=False, is_hip=False)
+        with (
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.arg_groups.model_overrides.deepseek_v2.get_platform",
+                return_value=platform,
+            ),
+        ):
+            self.assertEqual(
+                _deepseek_family_overrides(args, SimpleNamespace()),
+                {"attention_backend": "dsa", "page_size": 64},
+            )
+
     def test_gated_silu_does_not_touch_nonexistent_situ_enum(self):
         flashinfer = ModuleType("flashinfer")
         fused_moe = ModuleType("flashinfer.fused_moe")
