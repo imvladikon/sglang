@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -44,6 +45,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
 )
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -99,6 +101,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     print_warning_once,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -1838,6 +1841,16 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx = split_per_token(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
+    def _cuda_graph_memory_region(self):
+        """Return the TMS region released for CUDA-graph-only metadata."""
+        adapter = TorchMemorySaverAdapter.create(
+            enable=get_exec().features.enable_memory_saver
+            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        )
+        if not adapter.enabled:
+            return nullcontext()
+        return adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -1875,6 +1888,32 @@ class DeepseekSparseAttnBackend(
         )
 
         max_ctx_len = self.req_to_token.shape[1]
+        # These buffers are rewritten in full before each replay and can be
+        # safely released with the CUDA-graph region while the rollout engine
+        # is paused. Other metadata below is initialized once and must retain
+        # its contents, so it deliberately stays outside this region.
+        with self._cuda_graph_memory_region():
+            page_table = (
+                None
+                if self.dsa_drop_wide_page_table
+                else torch.zeros(
+                    max_num_tokens,
+                    max_ctx_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            flashmla_metadata = (
+                self._compute_flashmla_metadata(
+                    cache_seqlens=torch.ones(
+                        max_num_tokens, dtype=torch.int32, device=self.device
+                    ),
+                    seq_len_q=1,
+                )
+                if self.dsa_decode_impl == "flashmla_kv"
+                else None
+            )
+
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1901,26 +1940,8 @@ class DeepseekSparseAttnBackend(
                 if self.dsa_drop_wide_page_table
                 else None
             ),
-            "page_table": (
-                None
-                if self.dsa_drop_wide_page_table
-                else torch.zeros(
-                    max_num_tokens,
-                    max_ctx_len,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            ),
-            "flashmla_metadata": (
-                self._compute_flashmla_metadata(
-                    cache_seqlens=torch.ones(
-                        max_num_tokens, dtype=torch.int32, device=self.device
-                    ),
-                    seq_len_q=1,
-                )
-                if self.dsa_decode_impl == "flashmla_kv"
-                else None
-            ),
+            "page_table": page_table,
+            "flashmla_metadata": flashmla_metadata,
         }
 
     def _build_forward_metadata_cuda_graph(

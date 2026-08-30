@@ -70,6 +70,32 @@ class TestKPoolMqaBackend(CustomTestCase):
             )
         )
 
+    def test_cuda_graph_metadata_uses_memory_saver_region(self):
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        adapter = SimpleNamespace(
+            enabled=True,
+            region=MagicMock(return_value=MagicMock()),
+        )
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.get_exec",
+                return_value=SimpleNamespace(
+                    features=SimpleNamespace(enable_memory_saver=True)
+                ),
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.TorchMemorySaverAdapter.create",
+                return_value=adapter,
+            ),
+        ):
+            backend._cuda_graph_memory_region()
+
+        adapter.region.assert_called_once_with(tag="cuda_graph")
+
     def test_long_torch_fallback_keeps_kpool_backend_guard(self):
         backend = self._fallback_backend()
         indices = torch.arange(11, dtype=torch.int32).unsqueeze(0)

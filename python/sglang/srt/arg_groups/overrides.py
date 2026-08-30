@@ -2833,6 +2833,50 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     return {}
 
 
+_TOPK_BYPASSING_MOE_RUNNER_BACKENDS = frozenset(
+    {
+        "flashinfer_trtllm",
+        "experimental_sgl_trtllm",
+        "triton_kernel",
+    }
+)
+
+
+@register_post_process
+def _routed_experts_capture_backend_guard(view: Any) -> dict:
+    """Reject MoE runners that cannot return real per-token expert ids.
+
+    These fused runners bypass TopK materialization, so routed-expert capture
+    would otherwise return the zero-initialized host buffer. That is silent
+    data corruption for routing-replay training, and on a large EP model it
+    later surfaces as invalid all-to-all split sizes.
+    """
+    if not view.enable_return_routed_experts:
+        return {}
+    # The experimental runner switches back to STANDARD TopK when LoRA is
+    # enabled, so routed ids are materialized and captured normally there.
+    if view.moe_runner_backend == "experimental_sgl_trtllm" and getattr(
+        view, "enable_lora", False
+    ):
+        return {}
+    if view.moe_runner_backend not in _TOPK_BYPASSING_MOE_RUNNER_BACKENDS:
+        return {}
+    if view.quantization in (None, "fp8"):
+        logger.warning(
+            "--enable-return-routed-experts cannot capture routed experts "
+            "under moe_runner_backend=%r because TopK ids are bypassed; "
+            "falling back to moe_runner_backend='auto'.",
+            view.moe_runner_backend,
+        )
+        return {"moe_runner_backend": "auto"}
+    raise ValueError(
+        "--enable-return-routed-experts is incompatible with "
+        f"moe_runner_backend={view.moe_runner_backend!r}: the runner does not "
+        "materialize per-token TopK ids and there is no safe automatic "
+        f"fallback for quantization={view.quantization!r}."
+    )
+
+
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
     """FlashInfer CuteDSL / TRT-LLM / TRT-LLM-routed MoE runners require the

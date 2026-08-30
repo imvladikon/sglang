@@ -647,6 +647,12 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        # configure_subprocess() installed the preload hook around Process.start(),
+        # but Python state is inherited under fork. Co-located trainer imports
+        # (notably Megatron) can mutate the global TMS singleton to hook_mode="torch"
+        # while the runner is being initialized. Restore preload mode at the last
+        # boundary before load_model() enters the first TMS allocation region.
+        self.memory_saver_adapter.configure_current_process()
         self.load_model()
         prepare_moe_topk(
             model=self.model,
