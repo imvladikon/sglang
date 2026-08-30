@@ -38,7 +38,7 @@ dependencies = [
   "humming-kernels[cu13]==0.1.12",
   "interegular",
   "IPython",
-  "kernels>=0.14.1,<0.15",
+  "kernels>=0.16.0,<0.17",
   "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",
   "modelscope",
