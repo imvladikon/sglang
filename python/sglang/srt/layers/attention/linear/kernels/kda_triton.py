@@ -233,13 +233,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # CP/DP padding marks zero-length requests with -1. The Triton state
-        # kernel performs raw pointer arithmetic on these indices, so route
-        # padding to MambaPool's trailing sentinel slot instead of indexing
-        # before the state pool.
-        ssm_cache_indices = torch.where(
-            cache_indices >= 0, cache_indices, ssm_states.shape[0] - 1
-        ).to(torch.int32)
+        # Preserve -1 padding sentinels: chunk_gated_delta_rule_fwd_h masks both
+        # state loads and stores for them.
         return chunk_kda(
             q=q,
             k=k,
@@ -247,7 +242,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             g=g,
             beta=beta,
             initial_state=ssm_states,
-            initial_state_indices=ssm_cache_indices,
+            initial_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=query_start_loc,
             A_log=A_log,
