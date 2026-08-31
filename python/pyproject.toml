@@ -26,13 +26,16 @@ dependencies = [
   "cuda-python>=13.0",
   # Transitive dep of flashinfer-python, pinned because 1.6.0rc6 shipped no cp310 linux x86_64 wheel.
   "cuda-tile==1.6.0rc5",
+  # Keep JIT compiler/CCCL headers on torch's CUDA 13.0 toolkit. The cu13
+  # humming extra leaves these components unbounded and can otherwise mix a
+  # 13.2 compiler / 13.3 CCCL with torch's 13.0 runtime.
+  "cuda-toolkit[cccl,nvcc]==13.0.3",
   "datasets",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "distro",
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
   "fastapi",
-  "flash-attn-4>=4.0.0b18",
   "flashinfer_python[cu13]==0.6.18", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "humming-kernels[cu13]==0.1.12",

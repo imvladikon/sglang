@@ -67,6 +67,24 @@ class TestGlm53DependencyCompatibility(CustomTestCase):
         self.assertEqual(canonicalize_name(fa4.name), "flash-attn-4")
         self.assertEqual(str(fa4.specifier), ">=4.0.0b18")
 
+    def test_jit_toolkit_matches_torch_runtime(self):
+        project = self._project()
+        requirements = {
+            canonicalize_name(requirement.name): requirement
+            for value in project["dependencies"]
+            for requirement in [Requirement(value)]
+        }
+        sglang_toolkit = requirements["cuda-toolkit"]
+        torch_toolkit = next(
+            requirement
+            for value in importlib.metadata.requires("torch") or ()
+            for requirement in [Requirement(value)]
+            if canonicalize_name(requirement.name) == "cuda-toolkit"
+        )
+
+        self.assertEqual(sglang_toolkit.extras, {"cccl", "nvcc"})
+        self.assertEqual(sglang_toolkit.specifier, torch_toolkit.specifier)
+
 
 if __name__ == "__main__":
     unittest.main()
