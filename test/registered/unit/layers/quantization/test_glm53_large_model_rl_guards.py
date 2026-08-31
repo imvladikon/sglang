@@ -9,7 +9,10 @@ from unittest.mock import MagicMock, patch
 # and avoid the flashinfer_trtllm <-> fp8 registration cycle.
 import sglang.srt.layers.quantization.fp8  # noqa: F401
 import torch
-from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import get_activation_type
+from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+    align_fp8_moe_weights_for_flashinfer_trtllm,
+    get_activation_type,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 from sglang.srt.utils import torch_memory_saver_adapter as tms_adapter
@@ -90,6 +93,39 @@ class TestGlm53LargeModelRlGuards(CustomTestCase):
         )
 
         self.assertEqual(tuple(param.shape), (2, 8, 3))
+
+    def test_trtllm_fp8_alignment_preserves_expert_weight_loaders(self):
+        layer = SimpleNamespace(
+            moe_runner_config=SimpleNamespace(is_gated=True),
+            w13_weight=torch.nn.Parameter(
+                torch.zeros(2, 32, 16, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+            w2_weight=torch.nn.Parameter(
+                torch.zeros(2, 16, 16, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+            w13_input_scale=torch.nn.Parameter(torch.ones(2), requires_grad=False),
+            w2_input_scale=torch.nn.Parameter(torch.ones(2), requires_grad=False),
+            w13_weight_scale=torch.nn.Parameter(torch.ones(2), requires_grad=False),
+            w2_weight_scale=torch.nn.Parameter(torch.ones(2), requires_grad=False),
+        )
+        loader = MagicMock()
+        layer.w13_weight.weight_loader = loader
+        layer.w2_weight.weight_loader = loader
+        original_w13 = layer.w13_weight
+        original_w2 = layer.w2_weight
+
+        flashinfer = ModuleType("flashinfer")
+        flashinfer.shuffle_matrix_a = lambda weight, _tile: weight
+        flashinfer.reorder_rows_for_gated_act_gemm = lambda weight: weight
+        with patch.dict(sys.modules, {"flashinfer": flashinfer}):
+            align_fp8_moe_weights_for_flashinfer_trtllm(layer)
+
+        self.assertIs(layer.w13_weight, original_w13)
+        self.assertIs(layer.w2_weight, original_w2)
+        self.assertIs(layer.w13_weight.weight_loader, loader)
+        self.assertIs(layer.w2_weight.weight_loader, loader)
 
     def test_idle_empty_cache_is_suppressed_while_engine_paused(self):
         sleeper = IdleSleeper.__new__(IdleSleeper)
