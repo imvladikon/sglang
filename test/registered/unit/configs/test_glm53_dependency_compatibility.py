@@ -21,9 +21,13 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 class TestGlm53DependencyCompatibility(CustomTestCase):
-    def test_kernels_range_matches_pinned_transformers(self):
+    @staticmethod
+    def _project():
         with (REPO_ROOT / "python" / "pyproject.toml").open("rb") as file:
-            project = tomllib.load(file)["project"]
+            return tomllib.load(file)["project"]
+
+    def test_kernels_range_matches_pinned_transformers(self):
+        project = self._project()
 
         requirements = {
             canonicalize_name(requirement.name): requirement
@@ -46,6 +50,22 @@ class TestGlm53DependencyCompatibility(CustomTestCase):
         }
         self.assertEqual(transformers_kernels, {"<0.17,>=0.16.0"})
         self.assertEqual(str(sglang_kernels.specifier), "<0.17,>=0.16.0")
+
+    def test_training_stack_dependency_contract(self):
+        project = self._project()
+        requirements = {
+            canonicalize_name(requirement.name): requirement
+            for value in project["dependencies"]
+            for requirement in [Requirement(value)]
+        }
+
+        self.assertEqual(str(requirements["openai"].specifier), "<4,>=2.6.1")
+        self.assertIn(Version("3.6.0"), requirements["openai"].specifier)
+        self.assertNotIn("flash-attn-4", requirements)
+
+        fa4 = Requirement(project["optional-dependencies"]["fa4"][0])
+        self.assertEqual(canonicalize_name(fa4.name), "flash-attn-4")
+        self.assertEqual(str(fa4.specifier), ">=4.0.0b18")
 
 
 if __name__ == "__main__":
