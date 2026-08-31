@@ -33,6 +33,12 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         hip_int4 = patch("sglang.srt.layers.quantization.fp8._use_hip_int4", False)
         hip_int4.start()
         self.addCleanup(hip_int4.stop)
+        auto_marlin = patch(
+            "sglang.srt.layers.quantization.fp8.can_auto_enable_marlin_fp8",
+            return_value=False,
+        )
+        auto_marlin.start()
+        self.addCleanup(auto_marlin.stop)
 
     def tearDown(self):
         get_flags().moe.runner_backend = self._saved_runner_backend
@@ -112,6 +118,40 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
 
         self._assert_activation_params_absent(layer)
 
+    def test_ampere_fp8_moe_overrides_triton_with_marlin(self):
+        get_flags().moe.runner_backend = MoeRunnerBackend.TRITON
+        with (
+            patch("sglang.srt.layers.quantization.fp8._is_cuda", True),
+            patch(
+                "sglang.srt.layers.quantization.fp8.can_auto_enable_marlin_fp8",
+                return_value=True,
+            ),
+            patch("sglang.srt.layers.quantization.fp8.MoeRunner") as runner_cls,
+        ):
+            runner_cls.side_effect = lambda backend, _config: SimpleNamespace(
+                runner_backend=backend
+            )
+            method = self._make_block_fp8_method()
+            method.create_moe_runner(
+                layer=self._make_layer(), moe_runner_config=MoeRunnerConfig()
+            )
+
+        self.assertTrue(method.use_marlin)
+        self.assertEqual(method.runner.runner_backend, MoeRunnerBackend.MARLIN)
+        self.assertTrue(method._owns_moe_runner)
+
+    def test_ampere_block_fp8_moe_uses_marlin_post_process(self):
+        method = self._make_block_fp8_method()
+        method.use_marlin = True
+        layer = self._make_layer()
+        with patch(
+            "sglang.srt.layers.quantization.fp8.prepare_moe_fp8_layer_for_marlin"
+        ) as prepare:
+            method.process_weights_after_loading_block_quant(layer)
+
+        self.assertEqual(layer.weight_block_size, [128, 128])
+        prepare.assert_called_once_with(layer, size_k_first=False)
+
     def test_global_aiter_does_not_shuffle_triton_runner_weights(self):
         """SGLANG_USE_AITER also enables non-MoE kernels, so the selected MoE
         runner must own the preshuffled layout before weights are rewritten."""
@@ -129,7 +169,9 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
             patch("sglang.srt.layers.quantization.fp8._use_aiter", True),
             patch("sglang.srt.layers.quantization.fp8._is_fp8_fnuz", False),
             patch.object(method, "_convert_mxfp8_moe_to_block_fp8"),
-            patch("sglang.srt.layers.quantization.fp8.shuffle_weight") as shuffle,
+            patch(
+                "sglang.srt.layers.quantization.fp8.shuffle_weight", create=True
+            ) as shuffle,
         ):
             method.process_weights_after_loading_block_quant(layer)
 
@@ -150,7 +192,9 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
             patch("sglang.srt.layers.quantization.fp8._use_aiter", True),
             patch("sglang.srt.layers.quantization.fp8._is_fp8_fnuz", False),
             patch.object(method, "_convert_mxfp8_moe_to_block_fp8"),
-            patch("sglang.srt.layers.quantization.fp8.shuffle_weight") as shuffle,
+            patch(
+                "sglang.srt.layers.quantization.fp8.shuffle_weight", create=True
+            ) as shuffle,
         ):
             method.process_weights_after_loading_block_quant(layer)
 
@@ -179,6 +223,7 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
             patch(
                 "sglang.srt.layers.quantization.fp8.shuffle_weight",
                 side_effect=add_one,
+                create=True,
             ) as shuffle,
         ):
             method.process_weights_after_loading_block_quant(layer)

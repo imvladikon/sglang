@@ -206,7 +206,9 @@ def prepare_moe_fp8_layer_for_marlin(
         "performance for compute-heavy workloads."
     )
 
-    e = layer.num_experts
+    # EP keeps only local experts in the weight tensors. Using the global
+    # expert count here over-iterates and produces an invalid packed layout.
+    e = layer.w13_weight.shape[0]
     k = layer.hidden_size
     n = layer.intermediate_size_per_partition
     weight_block_size = getattr(layer, "weight_block_size", None)
