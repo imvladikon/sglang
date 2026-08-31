@@ -320,6 +320,7 @@ class WeightUpdater:
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
+        finalize: bool = True,
     ):
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
@@ -337,20 +338,45 @@ class WeightUpdater:
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
-        if load_format == "direct":
-            _model_load_weights_direct(self.get_model(), named_tensors)
-        elif load_format in self.custom_weight_loaders:
-            custom_loader = dynamic_import(load_format)
-            custom_loader(self.get_model(), named_tensors)
-        elif load_format is None:
-            self.get_model().load_weights(named_tensors)
-        else:
-            raise NotImplementedError(f"Unknown load_format={load_format}")
-        return True, "Success"
+        model = self.get_model()
+        quantized_transaction = False
+        try:
+            named_tensors = [
+                (
+                    name,
+                    _unwrap_tensor(
+                        tensor, tp_rank=self.tp_rank, device=infered_device
+                    ),
+                )
+                for name, tensor in named_tensors
+            ]
+            if load_format is None:
+                from sglang.srt.model_loader.marlin_reload import (
+                    begin_marlin_reload,
+                    finalize_marlin_reload,
+                )
+
+                quantized_transaction = begin_marlin_reload(model)
+
+            if load_format == "direct":
+                _model_load_weights_direct(model, named_tensors)
+            elif load_format in self.custom_weight_loaders:
+                custom_loader = dynamic_import(load_format)
+                custom_loader(model, named_tensors)
+            elif load_format is None:
+                model.load_weights(named_tensors)
+            else:
+                raise NotImplementedError(f"Unknown load_format={load_format}")
+
+            if quantized_transaction and finalize:
+                finalize_marlin_reload(model)
+            return True, "Success"
+        except Exception:
+            if quantized_transaction:
+                from sglang.srt.model_loader.marlin_reload import abort_marlin_reload
+
+                abort_marlin_reload(model)
+            raise
 
     def _update_weights_from_flattened_bucket(
         self: WeightUpdater,

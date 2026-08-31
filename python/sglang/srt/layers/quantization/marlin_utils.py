@@ -282,13 +282,26 @@ def check_moe_marlin_supports_layer(
 
 
 def marlin_make_workspace(
-    device: torch.device, max_blocks_per_sm: int = 1
+    device: torch.device,
+    max_blocks_per_sm: int = 1,
+    existing: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # In the new marlin kernel, we use the num of threadblocks as workspace
     # size. The num of threadblocks is sms_count * max_blocks_per_sm.
     sms = torch.cuda.get_device_properties(device).multi_processor_count
+    expected_size = sms * max_blocks_per_sm
+    if existing is not None:
+        expected = (torch.device(device), torch.int32, expected_size)
+        actual = (existing.device, existing.dtype, existing.numel())
+        if actual != expected:
+            raise ValueError(
+                "Existing Marlin workspace is incompatible with the current "
+                f"kernel configuration: expected={expected}, actual={actual}"
+            )
+        existing.zero_()
+        return existing
     return torch.zeros(
-        sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
+        expected_size, dtype=torch.int, device=device, requires_grad=False
     )
 
 
