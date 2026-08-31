@@ -1006,6 +1006,15 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             model.load_weights(weights)
 
+        # Some quantization backends change checkpoint/model-format tensors
+        # into a kernel layout. Preserve candidate metadata before processing;
+        # unchanged native layouts are pruned after the loop below.
+        from sglang.srt.model_loader.marlin_reload import (
+            record_marlin_reload_metadata,
+        )
+
+        record_marlin_reload_metadata(model, target_device)
+
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             memory_end = get_available_gpu_memory(
@@ -1026,6 +1035,12 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+
+        from sglang.srt.model_loader.marlin_reload import (
+            finalize_marlin_reload_metadata,
+        )
+
+        finalize_marlin_reload_metadata(model)
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -1605,6 +1620,15 @@ class DummyModelLoader(BaseModelLoader):
 
             _post_load_weights(model)
 
+            from sglang.srt.model_loader.marlin_reload import (
+                finalize_marlin_reload_metadata,
+                record_marlin_reload_metadata,
+            )
+
+            record_marlin_reload_metadata(
+                model, torch.device(device_config.device)
+            )
+
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
@@ -1615,6 +1639,8 @@ class DummyModelLoader(BaseModelLoader):
                     ):
                         continue
                     quant_method.process_weights_after_loading(module)
+
+            finalize_marlin_reload_metadata(model)
 
         return model.eval()
 

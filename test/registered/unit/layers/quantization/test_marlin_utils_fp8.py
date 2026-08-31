@@ -1,11 +1,11 @@
 """Tests for FP8 Marlin utilities."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-
-from sglang.srt.layers.quantization import marlin_utils_fp8
+from sglang.srt.layers.quantization import marlin_utils, marlin_utils_fp8
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -48,6 +48,71 @@ class TestFp8MarlinBias(CustomTestCase):
             marlin_utils_fp8.prepare_fp8_layer_for_marlin(layer)
 
         torch.testing.assert_close(layer.bias, original_bias)
+
+    def test_workspace_reuses_storage_and_rejects_incompatible_layout(self):
+        device = torch.device("cpu")
+        with patch(
+            "torch.cuda.get_device_properties",
+            return_value=SimpleNamespace(multi_processor_count=4),
+        ):
+            workspace = marlin_utils.marlin_make_workspace(device)
+            workspace.fill_(9)
+            reused = marlin_utils.marlin_make_workspace(device, existing=workspace)
+
+            self.assertIs(reused, workspace)
+            self.assertTrue(torch.all(reused == 0))
+            with self.assertRaisesRegex(ValueError, "incompatible"):
+                marlin_utils.marlin_make_workspace(
+                    device, max_blocks_per_sm=4, existing=workspace
+                )
+
+    def test_dense_prepare_preserves_workspace_across_repack(self):
+        size_k = 128
+        size_n = 64
+        layer = torch.nn.Module()
+        layer.input_size_per_partition = size_k
+        layer.output_size_per_partition = size_n
+        layer.orig_dtype = torch.float16
+        layer.weight_block_size = [128, 128]
+
+        def load_checkpoint_format():
+            layer.weight = torch.nn.Parameter(
+                torch.zeros((size_k, size_n), dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            layer.weight_scale_inv = torch.nn.Parameter(
+                torch.ones((1, 1), dtype=torch.float32), requires_grad=False
+            )
+
+        def fake_repack(**kwargs):
+            return torch.zeros(
+                kwargs["size_k"] // 16,
+                kwargs["size_n"] * 2,
+                dtype=torch.int32,
+            )
+
+        with (
+            patch(
+                "torch.cuda.get_device_properties",
+                return_value=SimpleNamespace(multi_processor_count=4),
+            ),
+            patch.object(
+                marlin_utils_fp8,
+                "gptq_marlin_repack",
+                side_effect=fake_repack,
+                create=True,
+            ),
+        ):
+            load_checkpoint_format()
+            marlin_utils_fp8.prepare_fp8_layer_for_marlin(layer)
+            workspace = layer.workspace
+            workspace_ptr = workspace.data_ptr()
+
+            load_checkpoint_format()
+            marlin_utils_fp8.prepare_fp8_layer_for_marlin(layer)
+
+        self.assertIs(layer.workspace, workspace)
+        self.assertEqual(layer.workspace.data_ptr(), workspace_ptr)
 
 
 if __name__ == "__main__":

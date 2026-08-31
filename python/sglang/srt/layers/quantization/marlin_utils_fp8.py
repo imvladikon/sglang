@@ -122,7 +122,9 @@ def prepare_fp8_layer_for_marlin(
     device = layer.weight.device
 
     # WORKSPACE
-    layer.workspace = marlin_make_workspace(device)
+    layer.workspace = marlin_make_workspace(
+        device, existing=getattr(layer, "workspace", None)
+    )
 
     # WEIGHT
     # Repack weights to marlin format
@@ -211,7 +213,9 @@ def prepare_moe_fp8_layer_for_marlin(
 
     # WORKSPACE
     device = layer.w13_weight.device
-    layer.workspace = marlin_make_workspace(device, 4)
+    layer.workspace = marlin_make_workspace(
+        device, 4, existing=getattr(layer, "workspace", None)
+    )
     perm = torch.empty(0, dtype=torch.int, device=device)
 
     # WEIGHT
