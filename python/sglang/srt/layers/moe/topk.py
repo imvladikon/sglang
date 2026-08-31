@@ -110,6 +110,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    get_device_capability,
     is_cpu,
     is_cuda,
     is_hip,
@@ -188,6 +189,14 @@ if _is_cuda:
 
     except ImportError:
         fused_topk_deepseek = None
+
+    # FlashInfer exposes this symbol on Ampere even though the kernel cannot
+    # run there. Select SGLang's native grouped-top-k before the first request
+    # instead of failing lazily inside the imported operator.
+    if fused_topk_deepseek is not None:
+        major, minor = get_device_capability()
+        if not _fused_topk_deepseek.is_compute_capability_supported(major * 10 + minor):
+            fused_topk_deepseek = None
 
 if _is_cuda or _is_hip or _is_xpu:
     if _is_xpu:
