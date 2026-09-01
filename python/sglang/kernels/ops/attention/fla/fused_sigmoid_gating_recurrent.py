@@ -75,6 +75,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
     """
+    if SPLIT_N_HV_GRID:
+        i_v, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        # The GPU wrapper asserts NK == 1. Keep N and HV on independent grid
+        # axes so large GLM5 decode batches do not exceed CUDA's grid limit.
+        i_k = 0
+    else:
+        i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        i_n, i_hv = i_nh // HV, i_nh % HV
     # PDL: overlap this kernel's prologue with the producer (the KDA/GDN
     # conv1d_update). All global loads below happen after the wait, so
     # numerics are unchanged. The immediate trigger releases the LAUNCH of
@@ -84,14 +92,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    if SPLIT_N_HV_GRID:
-        i_v, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-        # The GPU wrapper asserts NK == 1. Keep N and HV on independent grid
-        # axes so large GLM5 decode batches do not exceed CUDA's grid limit.
-        i_k = 0
-    else:
-        i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-        i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 
     if IS_VARLEN:
