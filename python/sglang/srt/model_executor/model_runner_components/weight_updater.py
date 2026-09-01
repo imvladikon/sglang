@@ -31,6 +31,44 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_WEIGHT_UPDATE_ACTIVE_ATTR = "_sglang_weight_update_transaction_active"
+
+
+def _begin_weight_update_transaction(model: torch.nn.Module) -> None:
+    """Start one model-level transaction spanning streamed tensor buckets."""
+    if getattr(model, _WEIGHT_UPDATE_ACTIVE_ATTR, False):
+        return
+    setattr(model, _WEIGHT_UPDATE_ACTIVE_ATTR, True)
+    try:
+        hook = getattr(model, "begin_weight_update_transaction", None)
+        if hook is not None:
+            hook()
+    except Exception:
+        _abort_weight_update_transaction(model)
+        raise
+
+
+def _finalize_weight_update_transaction(model: torch.nn.Module) -> None:
+    """Finalize model-level state after the last streamed tensor bucket."""
+    if not getattr(model, _WEIGHT_UPDATE_ACTIVE_ATTR, False):
+        return
+    hook = getattr(model, "finalize_weight_update_transaction", None)
+    if hook is not None:
+        hook()
+    setattr(model, _WEIGHT_UPDATE_ACTIVE_ATTR, False)
+
+
+def _abort_weight_update_transaction(model: torch.nn.Module) -> None:
+    """Discard model-level state after a failed streamed tensor update."""
+    if not getattr(model, _WEIGHT_UPDATE_ACTIVE_ATTR, False):
+        return
+    try:
+        hook = getattr(model, "abort_weight_update_transaction", None)
+        if hook is not None:
+            hook()
+    finally:
+        setattr(model, _WEIGHT_UPDATE_ACTIVE_ATTR, False)
+
 
 def _unsupported_derived_weight_cache_error() -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
@@ -340,6 +378,7 @@ class WeightUpdater:
 
         model = self.get_model()
         quantized_transaction = False
+        model_transaction = load_format is None
         try:
             named_tensors = [
                 (
@@ -356,6 +395,7 @@ class WeightUpdater:
                     finalize_marlin_reload,
                 )
 
+                _begin_weight_update_transaction(model)
                 quantized_transaction = begin_marlin_reload(model)
 
             if load_format == "direct":
@@ -368,14 +408,19 @@ class WeightUpdater:
             else:
                 raise NotImplementedError(f"Unknown load_format={load_format}")
 
-            if quantized_transaction and finalize:
-                finalize_marlin_reload(model)
+            if finalize:
+                if model_transaction:
+                    _finalize_weight_update_transaction(model)
+                if quantized_transaction:
+                    finalize_marlin_reload(model)
             return True, "Success"
         except Exception:
             if quantized_transaction:
                 from sglang.srt.model_loader.marlin_reload import abort_marlin_reload
 
                 abort_marlin_reload(model)
+            if model_transaction:
+                _abort_weight_update_transaction(model)
             raise
 
     def _update_weights_from_flattened_bucket(

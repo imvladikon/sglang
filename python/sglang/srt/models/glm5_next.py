@@ -1297,6 +1297,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             not self.encoder_only
             and getattr(text_config, "q_lora_rank", None) is not None
         )
+        self._weight_update_a_proj_cache: Optional[dict[str, torch.Tensor]] = None
 
         self.pp_group = get_pp_group()
         self.config = text_config
@@ -1674,7 +1675,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
             ]
 
         fuse_qkv_a_proj = getattr(self, "fuse_qkv_a_proj", False)
-        cached_a_proj: dict[str, torch.Tensor] = {} if fuse_qkv_a_proj else None
+        transaction_cache = getattr(self, "_weight_update_a_proj_cache", None)
+        persistent_a_proj_cache = fuse_qkv_a_proj and transaction_cache is not None
+        cached_a_proj: Optional[dict[str, torch.Tensor]] = (
+            transaction_cache
+            if persistent_a_proj_cache
+            else ({} if fuse_qkv_a_proj else None)
+        )
         qc = self.quant_config
         if qc is not None and qc.get_name() in {"awq", "awq_marlin", "moe_wna16"}:
             fused_cat_dim = 1
@@ -1804,7 +1811,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     if fuse_qkv_a_proj and (
                         "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                     ):
-                        cached_a_proj[name] = loaded_weight
+                        cached_a_proj[name] = (
+                            loaded_weight.detach().clone()
+                            if persistent_a_proj_cache
+                            else loaded_weight
+                        )
                         q_a_proj_name = (
                             name
                             if "q_a_proj" in name
@@ -1869,6 +1880,34 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
+
+    def begin_weight_update_transaction(self) -> None:
+        """Keep fused MLA inputs alive across streamed update buckets."""
+        if not self.fuse_qkv_a_proj:
+            return
+        if self._weight_update_a_proj_cache:
+            raise RuntimeError(
+                "Cannot begin a GLM weight update with pending fused MLA tensors: "
+                + ", ".join(sorted(self._weight_update_a_proj_cache))
+            )
+        self._weight_update_a_proj_cache = {}
+
+    def finalize_weight_update_transaction(self) -> None:
+        """Reject updates that did not provide both halves of an MLA fusion."""
+        if not self.fuse_qkv_a_proj:
+            return
+        pending = self._weight_update_a_proj_cache or {}
+        self._weight_update_a_proj_cache = None
+        if pending:
+            raise RuntimeError(
+                "Incomplete GLM fused MLA weight update; missing a q_a_proj or "
+                "kv_a_proj_with_mqa counterpart for: "
+                + ", ".join(sorted(pending))
+            )
+
+    def abort_weight_update_transaction(self) -> None:
+        """Drop cached MLA shards after any failed online update."""
+        self._weight_update_a_proj_cache = None
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:
