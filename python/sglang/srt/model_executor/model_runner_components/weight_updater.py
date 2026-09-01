@@ -354,6 +354,7 @@ class WeightUpdater:
                 from sglang.srt.model_loader.marlin_reload import (
                     begin_marlin_reload,
                     finalize_marlin_reload,
+                    process_ready_marlin_reload,
                 )
 
                 quantized_transaction = begin_marlin_reload(model)
@@ -365,6 +366,8 @@ class WeightUpdater:
                 custom_loader(model, named_tensors)
             elif load_format is None:
                 model.load_weights(named_tensors)
+                if quantized_transaction:
+                    process_ready_marlin_reload(model)
             else:
                 raise NotImplementedError(f"Unknown load_format={load_format}")
 
