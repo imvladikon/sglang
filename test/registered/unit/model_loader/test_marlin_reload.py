@@ -207,6 +207,20 @@ class _SyntheticGlmBlock(torch.nn.Module):
             )
 
 
+class _SyntheticGlmPostLoadBlock(_SyntheticGlmBlock):
+    """Mimic GLM MLA deriving runtime tensors inside model.load_weights."""
+
+    def __init__(self):
+        super().__init__()
+        self.derived_dense_weight = None
+
+    def load_weights(self, weights):
+        weights = list(weights)
+        super().load_weights(weights)
+        if any(name.startswith("dense.") for name, _ in weights):
+            self.derived_dense_weight = self.dense.weight.detach().clone()
+
+
 def _checkpoint(seed):
     base = seed * 16
     weights = [
@@ -242,6 +256,36 @@ def _cold_kernel(checkpoint):
 
 
 class TestMarlinReload(CustomTestCase):
+    def test_model_post_load_observes_model_format_before_marlin_repack(self):
+        model = _SyntheticGlmPostLoadBlock()
+        initial = _checkpoint(0)
+        model.load_weights(initial)
+        record_marlin_reload_metadata(model, torch.device("cpu"))
+        model.dense.quant_method.process_weights_after_loading(model.dense)
+        model.moe.quant_method.process_weights_after_loading(model.moe)
+        updated = _checkpoint(1)
+        expected = _cold_kernel(updated)
+        runner = SimpleNamespace(server_args=SimpleNamespace(weight_cache_mode="off"))
+        updater = WeightUpdater(
+            tp_rank=0,
+            device="cpu",
+            gpu_id=0,
+            model_config=None,
+            custom_weight_loaders={},
+            get_model=lambda: model,
+            update_model_fields=lambda *args, **kwargs: None,
+            recapture_cuda_graph=lambda: None,
+            get_model_runner=lambda: runner,
+        )
+
+        success, _ = updater.update_weights_from_tensor(updated, finalize=True)
+
+        self.assertTrue(success)
+        self.assertEqual(model.derived_dense_weight.shape, (8, 4))
+        expected_model_weight = torch.cat((updated[0][1], updated[2][1]), dim=0)
+        torch.testing.assert_close(model.derived_dense_weight, expected_model_weight)
+        torch.testing.assert_close(model.dense.weight, expected.dense.weight)
+
     def test_weight_updater_keeps_transaction_across_buckets(self):
         model = _SyntheticGlmBlock()
         model.load_weights(_checkpoint(0))

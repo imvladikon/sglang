@@ -47,6 +47,7 @@ class _MarlinReloadInfo:
     load_numel_total: int = 0
     enabled: bool = False
     active: bool = False
+    ready: bool = False
 
     def reset_transaction(self) -> None:
         self.kernel_tensors = None
@@ -57,6 +58,7 @@ class _MarlinReloadInfo:
         self.load_numel = 0
         self.load_numel_total = 0
         self.active = False
+        self.ready = False
 
 
 _RELOAD_INFO: WeakKeyDictionary[torch.nn.Module, _MarlinReloadInfo] = (
@@ -324,7 +326,7 @@ def _wrap_weight_loaders(layer: torch.nn.Module, info: _MarlinReloadInfo) -> Non
                     f"{__info.load_numel_total}"
                 )
             if __info.load_numel == __info.load_numel_total:
-                _process_layer(__layer, __info)
+                _materialize_and_load_layer(__layer, __info)
             return result
 
         marlin_reload_loader.__name__ = "marlin_reload_loader"
@@ -400,7 +402,10 @@ def _restore_kernel_tensors(layer: torch.nn.Module, info: _MarlinReloadInfo) -> 
 
 
 @torch.no_grad()
-def _process_layer(layer: torch.nn.Module, info: _MarlinReloadInfo) -> None:
+def _materialize_and_load_layer(
+    layer: torch.nn.Module, info: _MarlinReloadInfo
+) -> None:
+    """Materialize a complete layer in model format for model post-processing."""
     _materialize_layer(layer, info)
     for value in _all_direct_tensors(layer).values():
         _set_weight_loader(value, _get_original_loader(value))
@@ -409,6 +414,13 @@ def _process_layer(layer: torch.nn.Module, info: _MarlinReloadInfo) -> None:
         param = getattr(layer, param_name)
         bound.arguments["param"] = param
         _get_original_loader(param)(*bound.args, **bound.kwargs)
+    info.ready = True
+
+
+@torch.no_grad()
+def _process_layer(layer: torch.nn.Module, info: _MarlinReloadInfo) -> None:
+    if not info.ready:
+        raise RuntimeError("FP8 Marlin reload tried to process an unready layer")
 
     quant_method = getattr(layer, "quant_method", None)
     if not isinstance(quant_method, QuantizeMethodBase):
@@ -427,6 +439,23 @@ def _process_layer(layer: torch.nn.Module, info: _MarlinReloadInfo) -> None:
         old.data.copy_(new_buffers[name].data)
     _restore_kernel_tensors(layer, info)
     info.reset_transaction()
+
+
+def process_ready_marlin_reload(model: torch.nn.Module) -> None:
+    """Repack complete layers after model.load_weights post-processing finishes.
+
+    Model loaders such as the DeepSeek/GLM MLA loader derive ``w_kc`` and
+    ``w_vc`` from checkpoint-format ``kv_b_proj`` tensors at the end of
+    ``load_weights``.  Keep complete layers in model format until that model
+    hook has run, then convert them back to their live kernel format.
+    """
+    if not getattr(model, "_sglang_marlin_reload_active", False):
+        return
+    for layer in model.modules():
+        info = _RELOAD_INFO.get(layer)
+        if info is None or not info.enabled or not info.active or not info.ready:
+            continue
+        _process_layer(layer, info)
 
 
 def begin_marlin_reload(model: torch.nn.Module) -> bool:
@@ -476,6 +505,8 @@ def finalize_marlin_reload(model: torch.nn.Module) -> None:
     """Finish a streaming update, rejecting incomplete Marlin layers."""
     if not getattr(model, "_sglang_marlin_reload_active", False):
         return
+
+    process_ready_marlin_reload(model)
 
     incomplete = []
     for module_name, layer in model.named_modules():
