@@ -7,13 +7,20 @@ the MxFP4 wrapper methods borrow an `Fp8MoEMethod` for weight loading only
 and never give it a `moe_runner_config` (issue #36264).
 """
 
+import sys
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
+# Register FP8 before importing the FlashInfer runner to avoid the
+# flashinfer_trtllm <-> fp8 module cycle during isolated test collection.
+import sglang.srt.layers.quantization.fp8  # noqa: F401
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+    align_fp8_moe_weights_for_flashinfer_trtllm,
+)
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.runtime_context import get_flags
@@ -232,6 +239,40 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         self.assertEqual(shuffle.call_count, 2)
         torch.testing.assert_close(layer.w13_weight, original_w13 + 1)
         torch.testing.assert_close(layer.w2_weight, original_w2 + 1)
+
+    def test_trtllm_fp8_alignment_preserves_expert_weight_loaders(self):
+        """Initial layout conversion must not discard hot-update routing."""
+        layer = SimpleNamespace(
+            moe_runner_config=SimpleNamespace(is_gated=True),
+            w13_weight=torch.nn.Parameter(
+                torch.zeros(2, 32, 16, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+            w2_weight=torch.nn.Parameter(
+                torch.zeros(2, 16, 16, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+            w13_input_scale=torch.nn.Parameter(torch.ones(2), requires_grad=False),
+            w2_input_scale=torch.nn.Parameter(torch.ones(2), requires_grad=False),
+            w13_weight_scale=torch.nn.Parameter(torch.ones(2), requires_grad=False),
+            w2_weight_scale=torch.nn.Parameter(torch.ones(2), requires_grad=False),
+        )
+        loader = MagicMock()
+        layer.w13_weight.weight_loader = loader
+        layer.w2_weight.weight_loader = loader
+        original_w13 = layer.w13_weight
+        original_w2 = layer.w2_weight
+
+        flashinfer = ModuleType("flashinfer")
+        flashinfer.shuffle_matrix_a = lambda weight, _tile: weight
+        flashinfer.reorder_rows_for_gated_act_gemm = lambda weight: weight
+        with patch.dict(sys.modules, {"flashinfer": flashinfer}):
+            align_fp8_moe_weights_for_flashinfer_trtllm(layer)
+
+        self.assertIs(layer.w13_weight, original_w13)
+        self.assertIs(layer.w2_weight, original_w2)
+        self.assertIs(layer.w13_weight.weight_loader, loader)
+        self.assertIs(layer.w2_weight.weight_loader, loader)
 
 
 if __name__ == "__main__":

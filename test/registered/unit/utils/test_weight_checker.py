@@ -597,8 +597,11 @@ class TestHandle(_WeightCheckerTestBase):
         torch.testing.assert_close(self.model.b, before_b)
         self.assertFalse(torch.equal(self.model.w, before_w))
         with torch.no_grad():
-            self.model.w.copy_(before_w)
-            self.model.running_mean.zero_()
+            selected = dict(self.model.named_parameters())
+            selected.update(dict(self.model.named_buffers()))
+            for name, tensor in selected.items():
+                if not name.startswith("b"):
+                    tensor.copy_(self.checker._snapshot_tensors[name].to(tensor.device))
         self.checker.handle("compare", skip_prefixes=("b",))
 
     def test_routes_to_actions(self):
