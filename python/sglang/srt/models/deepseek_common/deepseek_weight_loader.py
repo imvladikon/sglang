@@ -173,6 +173,9 @@ class DeepseekV2WeightLoaderMixin:
     pp_group: GroupCoordinator
     num_fused_shared_experts: int
 
+    _weight_update_a_proj_cache: Optional[Dict[str, torch.Tensor]] = None
+    _weight_update_indexer_wk_cache: Optional[Dict[str, Dict[str, torch.Tensor]]] = None
+
     def do_load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
@@ -216,9 +219,23 @@ class DeepseekV2WeightLoaderMixin:
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
+        transaction_a_proj_cache = getattr(self, "_weight_update_a_proj_cache", None)
+        persistent_a_proj_cache = (
+            fuse_qkv_a_proj and transaction_a_proj_cache is not None
+        )
+        cached_a_proj = (
+            transaction_a_proj_cache
+            if persistent_a_proj_cache
+            else ({} if fuse_qkv_a_proj else None)
+        )
 
-        pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
+        transaction_indexer_wk_cache = getattr(
+            self, "_weight_update_indexer_wk_cache", None
+        )
+        persistent_indexer_wk_cache = transaction_indexer_wk_cache is not None
+        pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = (
+            transaction_indexer_wk_cache if persistent_indexer_wk_cache else {}
+        )
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
@@ -295,7 +312,11 @@ class DeepseekV2WeightLoaderMixin:
                     ".indexer.wk." in name or ".indexer.weights_proj." in name
                 ) and _load_fused_indexer_wk(
                     name,
-                    loaded_weight,
+                    (
+                        loaded_weight.detach().clone()
+                        if persistent_indexer_wk_cache
+                        else loaded_weight
+                    ),
                     params_dict,
                     pending_indexer_wk,
                     self.quant_config,
@@ -371,8 +392,10 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
-                                loaded_weight
+                            cached_a_proj[name] = (
+                                loaded_weight.detach().clone()
+                                if persistent_a_proj_cache
+                                else _clone_if_runai_streamed_tensor(loaded_weight)
                             )
                             q_a_proj_name = (
                                 name
@@ -468,6 +491,50 @@ class DeepseekV2WeightLoaderMixin:
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+    def begin_weight_update_transaction(self) -> None:
+        """Keep fused MLA and DSA source tensors across streamed buckets."""
+        pending = []
+        if getattr(self, "_weight_update_a_proj_cache", None):
+            pending.append("MLA q/kv projections")
+        if getattr(self, "_weight_update_indexer_wk_cache", None):
+            pending.append("DSA indexer weights/scales")
+        if pending:
+            raise RuntimeError(
+                "Cannot begin a DeepSeek/GLM weight update with pending "
+                + " and ".join(pending)
+            )
+
+        self._weight_update_a_proj_cache = (
+            {} if getattr(self, "fuse_qkv_a_proj", False) else None
+        )
+        self._weight_update_indexer_wk_cache = {}
+
+    def finalize_weight_update_transaction(self) -> None:
+        """Reject an update that ended before a fused source pair completed."""
+        pending_a_proj = self._weight_update_a_proj_cache or {}
+        pending_indexer = self._weight_update_indexer_wk_cache or {}
+        self._weight_update_a_proj_cache = None
+        self._weight_update_indexer_wk_cache = None
+
+        incomplete = []
+        if pending_a_proj:
+            incomplete.append(
+                "MLA q_a_proj/kv_a_proj_with_mqa counterparts: "
+                + ", ".join(sorted(pending_a_proj))
+            )
+        for name, pieces in sorted(pending_indexer.items()):
+            missing = sorted({"weight", "scale"} - pieces.keys())
+            incomplete.append(f"DSA {name} missing {'/'.join(missing)}")
+        if incomplete:
+            raise RuntimeError(
+                "Incomplete DeepSeek/GLM fused weight update; " + "; ".join(incomplete)
+            )
+
+    def abort_weight_update_transaction(self) -> None:
+        """Drop cached source tensors after any failed streamed update."""
+        self._weight_update_a_proj_cache = None
+        self._weight_update_indexer_wk_cache = None
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """
