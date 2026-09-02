@@ -13,6 +13,7 @@ from sglang.srt.utils import is_hip
 BLOCK_SIZE_K = 64
 # The released model uses 128.  Compact architecture-contract checkpoints use
 # 64 while retaining the exact same one-head/one-FP8-group KPool algorithm.
+INDEX_HEAD_DIM = 128
 SUPPORTED_INDEX_HEAD_DIMS = (64, 128)
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
