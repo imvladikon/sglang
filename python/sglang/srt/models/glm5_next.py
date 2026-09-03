@@ -118,7 +118,12 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_lora,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -136,6 +141,19 @@ if _use_aiter_gfx95:
 
 logger = logging.getLogger(__name__)
 _GLM_AITER_FUSED_MHC_LOGGED = False
+
+
+def _can_fuse_kda_projections(
+    quant_config: Optional[QuantizationConfig],
+    head_shard_size: int,
+    tensor_parallel_size: int,
+) -> bool:
+    """Whether the fused KDA layout is compatible with the active runtime."""
+    return (
+        quant_config is None
+        and head_shard_size == tensor_parallel_size
+        and not get_lora().enable_lora
+    )
 
 
 @torch.compile
@@ -366,7 +384,13 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # The generic LoRA runtime wraps the individual KDA projections, not
+        # MergedColumnParallelRepeatedLinear/ColumnParallelBatchedLinear.
+        self.do_fuse_qkvbfg = _can_fuse_kda_projections(
+            quant_config,
+            head_shard_size,
+            self.tp_size,
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -1279,6 +1303,75 @@ class Glm5NextForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
     fall_back_to_pt_during_load = False
+
+    supported_lora_modules = [
+        # KDA attention. q/k/v are stacked in the serving-side qkv buffer.
+        "qkv_proj",
+        "o_proj",
+        "b_proj",
+        "f_a_proj",
+        "f_b_proj",
+        "g_a_proj",
+        "g_b_proj",
+        # DSA MLA. Indexer projections remain explicit opt-ins.
+        "fused_qkv_a_proj_with_mqa",
+        "q_b_proj",
+        "kv_b_proj",
+        # Dense MLP, shared expert, and routed experts.
+        "gate_up_proj",
+        "down_proj",
+        "embed_tokens",
+        "lm_head",
+    ]
+
+    def _lora_is_sparse_layer(self, layer_idx: int) -> bool:
+        config = self.config
+        moe_frequency = getattr(config, "moe_layer_freq", 1) or 1
+        return (
+            getattr(config, "n_routed_experts", None) is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % moe_frequency == 0
+        )
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """Return the physical LoRA geometry for one hybrid decoder layer."""
+        from sglang.srt.lora.utils import get_default_hidden_dim
+
+        config = self.config
+        linear_config = config.linear_attn_config
+        kda_heads = linear_config["num_heads"]
+        kda_head_dim = linear_config["head_dim"]
+        kda_projection = kda_heads * kda_head_dim
+
+        if module_name == "qkv_proj":
+            return config.hidden_size, 3 * kda_projection
+        if module_name == "o_proj":
+            input_dim = (
+                kda_projection
+                if config.is_kda_layer(layer_idx)
+                else config.num_attention_heads * config.v_head_dim
+            )
+            return input_dim, config.hidden_size
+        if module_name in {"f_a_proj", "g_a_proj"}:
+            return config.hidden_size, kda_head_dim
+        if module_name in {"f_b_proj", "g_b_proj"}:
+            return kda_head_dim, kda_projection
+        if module_name == "b_proj":
+            return config.hidden_size, kda_heads
+        if module_name in {"gate_up_proj", "down_proj"}:
+            intermediate = config.intermediate_size
+            if self._lora_is_sparse_layer(layer_idx):
+                intermediate = config.moe_intermediate_size * (
+                    config.n_shared_experts or 1
+                )
+            if module_name == "gate_up_proj":
+                return config.hidden_size, 2 * intermediate
+            return intermediate, config.hidden_size
+        if module_name == "gate_up_proj_moe":
+            return config.hidden_size, 2 * config.moe_intermediate_size
+        if module_name == "down_proj_moe":
+            return config.moe_intermediate_size, config.hidden_size
+        return get_default_hidden_dim(module_name, config, layer_idx)
 
     def __init__(
         self,

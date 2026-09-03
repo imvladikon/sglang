@@ -4419,6 +4419,12 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).
     "qkvr",
     "wo_ud",
+    # GLM-5.3-Flash KDA gate projections.
+    "b_proj",
+    "f_a_proj",
+    "f_b_proj",
+    "g_a_proj",
+    "g_b_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
