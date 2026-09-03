@@ -170,7 +170,6 @@ class MiniLoadBalancer:
                 total=self.timeout
             )  # Add timeout for request reliability
         ) as session:
-
             tasks = [
                 session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
                 session.post(f"{decode_server}/{endpoint}", json=decode_req),
