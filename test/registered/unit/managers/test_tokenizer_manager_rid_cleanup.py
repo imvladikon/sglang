@@ -692,6 +692,9 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
     def test_cancel_after_dispatch_sends_abort_and_keeps_state(self, _wrap_shm):
         tm = _make_tm_for_generate(self)
         tm.cuda_vmm_feature_transport = Mock()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+            return_value=[]
+        )
         tm._dispatch_to_scheduler = Mock()
         rid = "disconnect_zombie"
         obj = _make_generate_obj(rid, is_single=True)
