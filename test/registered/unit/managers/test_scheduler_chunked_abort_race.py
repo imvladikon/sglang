@@ -23,6 +23,7 @@ class _FakeReq:
         self.mamba_pool_idx = None
         self.to_finish = None
         self._finished = False
+        self.kv = SimpleNamespace(holds_kv=True)
 
     def finished(self):
         return self._finished
@@ -35,6 +36,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.waiting_queue = []
     sched.dllm_config = None
     sched.grammar_manager = Mock()
+    sched.mm_receiver = None
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
     sched.ps = SimpleNamespace(pp_size=1)
