@@ -329,7 +329,6 @@ def prepare_moe_fp8_layer_for_marlin(
         bias = torch.nn.Parameter(bias, requires_grad=False)
         setattr(layer, name, bias)
 
-
 def pack_fp8_to_int32(
     fp8_tensor: torch.Tensor, size_k_first: bool = True
 ) -> torch.Tensor:
@@ -345,36 +344,3 @@ def pack_fp8_to_int32(
     # with `.view(torch.int32)`, it become (N, K // 4)
     int32_tensor = fp8_tensor.view(torch.int32)
     return int32_tensor.T.contiguous() if size_k_first else int32_tensor
-
-
-def marlin_quant_fp8_torch(weight, group_size):
-    size_n, size_k = weight.shape
-    device = weight.device
-
-    if group_size != -1:
-        scales = weight.view(size_n, -1, group_size).abs().max(-1)[0] / 448
-        repeated_scales = scales.repeat_interleave(group_size, 1)
-        fp8_weight = (weight / repeated_scales).to(torch.float8_e4m3fn)
-        weight_ref = fp8_weight.to(weight.dtype) * repeated_scales
-    else:
-        scales = weight.view(size_n, 1, group_size).abs().max(-1)[0] / 448
-        repeated_scales = scales.repeat_interleave(size_k, 1)
-        fp8_weight = (weight / repeated_scales).to(torch.float8_e4m3fn)
-        weight_ref = fp8_weight.to(weight.dtype) * repeated_scales
-
-    packed_weight = pack_fp8_to_int32(fp8_weight, False).T.contiguous()
-    marlin_qweight = gptq_marlin_repack(
-        b_q_weight=packed_weight,
-        perm=torch.empty(0, dtype=torch.int, device=device),
-        size_k=size_k,
-        size_n=size_n,
-        num_bits=8,
-    )
-
-    marlin_scales = marlin_permute_scales(
-        s=scales.T, size_k=size_k, size_n=size_n, group_size=group_size
-    )
-
-    marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
-
-    return weight_ref.T, marlin_qweight, marlin_scales
