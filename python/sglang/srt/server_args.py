@@ -1766,6 +1766,8 @@ class ServerArgs:
                 "tilelang",
                 "aiter",
                 "trtllm",
+                "triton",
+                "torch",
             ],
             resolvable=True,
         ),
@@ -1797,6 +1799,8 @@ class ServerArgs:
                 "tilelang",
                 "aiter",
                 "trtllm",
+                "triton",
+                "torch",
             ],
             resolvable=True,
         ),
@@ -1805,8 +1809,8 @@ class ServerArgs:
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
-            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
-            choices=["auto", "deepgemm", "cutedsl", "aiter"],
+            help="DSA indexer MQA logits backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (SM100 only), 'aiter' (ROCm only), 'triton' (E4M3 storage with BF16 compute on SM80+), or the architecture-independent correctness fallback 'torch'.",
+            choices=["auto", "deepgemm", "cutedsl", "aiter", "triton", "torch"],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -3800,7 +3804,6 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 
@@ -3904,6 +3907,8 @@ class ServerArgs:
                 "tilelang",
                 "aiter",
                 "trtllm",
+                "triton",
+                "torch",
             ],
             help="[Deprecated] Use --dsa-prefill-backend instead.",
         )
@@ -3924,6 +3929,8 @@ class ServerArgs:
                 "tilelang",
                 "aiter",
                 "trtllm",
+                "triton",
+                "torch",
             ],
             help="[Deprecated] Use --dsa-decode-backend instead.",
         )

@@ -1,10 +1,10 @@
-"""Triton sparse-MLA forward for the DSA fp8 prefill path.
+"""Triton sparse-MLA forward for selected GLM-5/DeepSeek KV rows.
 
-A per-query flash-attention kernel over the indexer-selected topk KV. On
-gfx950 this is ~1.6x faster than the TileLang partial+combine kernel for the
-prefill regime (n_groups=1): the attention tile is tiny (M=16 heads = one
-16x16 MFMA), so a small-warp per-program kernel avoids the intra-block
-coordination overhead of the 256-thread TileLang block.
+A per-query online-softmax kernel over the indexer-selected top-k KV.  The
+same math is used for the existing FP8 ROCm prefill path and for the explicit
+BF16 CUDA SM80 fallback.  The latter avoids Hopper-only barriers in the
+TileLang v2 kernel while retaining BF16 tensor-core compute and FP32 softmax
+state.
 """
 
 import torch
@@ -48,7 +48,7 @@ def _sparse_mla_fwd_kernel(
     idx_ptr,
     o_ptr,
     sm_scale,
-    fp8_max,
+    probability_scale,
     topk,
     H: tl.constexpr,
     DIM: tl.constexpr,
@@ -103,8 +103,8 @@ def _sparse_mla_fwd_kernel(
         p = tl.exp(qk - m_safe[:, None])  # [H, BLOCK_N]
         l_i = l_i * alpha + tl.sum(p, axis=1)
 
-        p_fp8 = (p * fp8_max).to(q_nope_ptr.dtype.element_ty)
-        pv = tl.dot(p_fp8, kv_main).to(tl.float32) * (1.0 / fp8_max)
+        p_compute = (p * probability_scale).to(q_nope_ptr.dtype.element_ty)
+        pv = tl.dot(p_compute, kv_main).to(tl.float32) * (1.0 / probability_scale)
         acc = acc * alpha[:, None] + pv
         m_i = m_new
 
@@ -124,21 +124,34 @@ def triton_sparse_mla_fwd(
     sm_scale: float,
     d_v: int = 512,
 ) -> torch.Tensor:
-    """q_nope: [seq, H, d_v] fp8, q_rope: [seq, H, dim-d_v] fp8,
-    kv: [num_pages, 1, dim] fp8, indices: [seq, 1, topk].
+    """q_nope: [seq, H, d_v], q_rope: [seq, H, dim-d_v],
+    kv: [num_pages, 1, dim], indices: [seq, 1, topk].
 
-    Reads q from the two un-concatenated tensors directly (no q_nope/q_rope
-    concat). Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd.
+    Q and KV must have the same BF16 or FP8 dtype. Reads Q from the two
+    un-concatenated tensors directly and returns ``[1, seq, H, d_v]`` BF16 to
+    match ``tilelang_sparse_fwd``.
     """
     seq, H, d_v_in = q_nope.shape
     assert d_v_in == d_v
     d_tail = q_rope.shape[-1]
     dim = kv.shape[-1]
     topk = indices.shape[-1]
+    if q_nope.dtype != q_rope.dtype or q_nope.dtype != kv.dtype:
+        raise ValueError(
+            "Triton sparse MLA requires matching Q/KV dtypes, got "
+            f"q_nope={q_nope.dtype}, q_rope={q_rope.dtype}, kv={kv.dtype}."
+        )
+    if q_nope.dtype not in (
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
+        raise ValueError(f"Unsupported Triton sparse-MLA dtype: {q_nope.dtype}")
     q_nope = q_nope.contiguous()
     q_rope = q_rope.contiguous()
     out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
     # BLOCK_N / num_warps / num_stages are chosen by @triton.autotune.
+    probability_scale = _FP8_MAX if q_nope.dtype != torch.bfloat16 else 1.0
     _sparse_mla_fwd_kernel[(seq,)](
         q_nope,
         q_rope,
@@ -146,7 +159,7 @@ def triton_sparse_mla_fwd(
         indices,
         out,
         sm_scale,
-        _FP8_MAX,
+        probability_scale,
         topk,
         H=H,
         DIM=dim,

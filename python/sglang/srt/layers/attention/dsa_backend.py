@@ -13,7 +13,6 @@ from typing import (
 )
 
 import torch
-
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -283,6 +282,8 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "fa3",
     "tilelang",
     "trtllm",
+    "triton",
+    "torch",
 ]
 
 
@@ -402,6 +403,36 @@ class DeepseekSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+
+        if any(
+            impl in ("torch", "triton")
+            for impl in (self.dsa_prefill_impl, self.dsa_decode_impl)
+        ):
+            if self.kv_cache_dtype not in (
+                torch.bfloat16,
+                torch.float16,
+                torch.float32,
+            ):
+                raise ValueError(
+                    "The Torch/Triton DSA attention fallback requires an unquantized "
+                    f"KV cache; got {self.kv_cache_dtype}. Set --kv-cache-dtype "
+                    "bfloat16."
+                )
+            if envs.SGLANG_DSA_FUSE_TOPK.get():
+                raise ValueError(
+                    "The Torch/Triton DSA attention fallback requires "
+                    "SGLANG_DSA_FUSE_TOPK=false."
+                )
+        if "triton" in (self.dsa_prefill_impl, self.dsa_decode_impl):
+            if not is_cuda() or self.device_sm_major < 8:
+                raise ValueError(
+                    "The BF16 Triton DSA attention backend requires CUDA SM80+."
+                )
+            if self.kv_cache_dtype != torch.bfloat16:
+                raise ValueError(
+                    "The validated SM80 Triton DSA attention path requires "
+                    f"BF16 KV cache, got {self.kv_cache_dtype}."
+                )
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -1886,7 +1917,6 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -2010,7 +2040,38 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
-        if dsa_impl == "tilelang":
+        if dsa_impl in ("torch", "triton"):
+            if topk_transform_method == TopkTransformMethod.RAGGED:
+                page_table_1 = topk_indices
+                if any(forward_batch.extend_prefix_lens_cpu):
+                    page_table_1_flattened = (
+                        self.forward_metadata.page_table_1_flattened
+                    )
+                    assert page_table_1_flattened is not None
+                    kv_cache = kv_cache.reshape(-1, kv_cache.shape[-1])[
+                        page_table_1_flattened.long()
+                    ]
+                else:
+                    assert k is not None and k_rope is not None
+                    kv_cache = _cat([k, k_rope], dim=-1)
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if dsa_impl == "torch":
+                return self._forward_torch_sparse_mla(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                )
+            return self._forward_triton_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif dsa_impl == "tilelang":
             if q_rope is not None:
                 # Triton prefill kernel reads q_nope/q_rope directly, skipping
                 # the concat (it splits q into main/tail internally anyway).
@@ -2196,7 +2257,6 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -2271,7 +2331,25 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        if self.dsa_decode_impl == "flashmla_sparse":
+        if self.dsa_decode_impl in ("torch", "triton"):
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.dsa_decode_impl == "torch":
+                return self._forward_torch_sparse_mla(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                )
+            return self._forward_triton_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
@@ -2450,6 +2528,58 @@ class DeepseekSparseAttnBackend(
             o = o[:, :num_heads, :]
 
         return o
+
+    def _forward_torch_sparse_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.dsa.torch_dsa_fallback import (
+            sparse_mla_torch_dsa,
+        )
+
+        return sparse_mla_torch_dsa(
+            query=q_all,
+            kv_cache=kv_cache,
+            indices=page_table_1,
+            softmax_scale=sm_scale,
+            value_dim=v_head_dim,
+            chunk_rows=envs.SGLANG_DSA_TORCH_FALLBACK_CHUNK_ROWS.get(),
+        )
+
+    def _forward_triton_sparse_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+            triton_sparse_mla_fwd,
+        )
+
+        if q_all.shape[-1] != 576 or v_head_dim != 512:
+            raise ValueError(
+                "The validated GLM-5/DeepSeek Triton sparse-MLA contract is "
+                f"QK=576 and V=512, got QK={q_all.shape[-1]}, V={v_head_dim}."
+            )
+        if page_table_1.shape[-1] != 2048:
+            raise ValueError(
+                "The validated Triton sparse-MLA top-k is 2048, got "
+                f"{page_table_1.shape[-1]}."
+            )
+        return triton_sparse_mla_fwd(
+            q_nope=q_all[..., :v_head_dim],
+            q_rope=q_all[..., v_head_dim:],
+            kv=kv_cache.reshape(-1, 1, q_all.shape[-1]),
+            indices=page_table_1.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+        )[0]
 
     def q8kv8_born_fp8_q_eligible(
         self, forward_batch: ForwardBatch, num_heads: int

@@ -6,8 +6,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
-
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.attention.dsa.triton_mqa_logits_sm80 import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
@@ -25,6 +28,10 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
 )
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
+)
+from sglang.srt.layers.attention.dsa.torch_dsa_fallback import (
+    fp8_paged_mqa_logits_torch_dsa,
+    fp8_ragged_mqa_logits_torch_dsa,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
@@ -321,6 +328,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
+        if self.paged_mqa_logits_backend.is_triton():
+            if not _is_cuda:
+                raise ValueError("dsa_paged_mqa_logits_backend='triton' requires CUDA.")
+            capability = torch.cuda.get_device_capability()
+            if capability[0] < 8:
+                raise ValueError(
+                    "The BF16 Triton DSA indexer requires SM80 or newer; got "
+                    f"sm_{capability[0]}{capability[1]}."
+                )
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -866,7 +882,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
         use_dg_native = (
-            not use_cute_dsl
+            self.paged_mqa_logits_backend.is_deepgemm()
             and _is_cuda
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
@@ -880,7 +896,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
-        if _is_cuda:
+        if _is_cuda and self.paged_mqa_logits_backend.is_deepgemm():
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
@@ -896,7 +912,35 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if self.paged_mqa_logits_backend.is_aiter():
+        if self.paged_mqa_logits_backend.is_torch():
+            logits = fp8_paged_mqa_logits_torch_dsa(
+                q_fp8[:q_offset].unsqueeze(1),
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d,
+                block_tables,
+                None,
+                max_seq_len,
+                kv_chunk_tokens=envs.SGLANG_DSA_TORCH_FALLBACK_KV_CHUNK_TOKENS.get(),
+                clean_logits=False,
+            )
+        elif self.paged_mqa_logits_backend.is_triton():
+            if q_offset != B:
+                raise ValueError(
+                    "The SM80 Triton DSA indexer currently requires "
+                    "non-speculative decode (one query per request); got "
+                    f"q_offset={q_offset}, batch_size={B}."
+                )
+            logits = fp8_paged_mqa_logits_triton(
+                q_fp8[:q_offset].reshape(B, 1, self.n_heads, self.head_dim),
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d,
+                block_tables,
+                max_seq_len,
+                clean_logits=False,
+            )
+        elif self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -1116,7 +1160,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                if _is_hip:
+                if self.paged_mqa_logits_backend.is_torch():
+                    logits = fp8_ragged_mqa_logits_torch_dsa(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        chunk_rows=envs.SGLANG_DSA_TORCH_FALLBACK_CHUNK_ROWS.get(),
+                        clean_logits=False,
+                    )
+                elif self.paged_mqa_logits_backend.is_triton():
+                    logits = fp8_mqa_logits_triton(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
+                elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1175,7 +1238,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             end = min(start + max_rows, q_offset)
 
             with self._with_real_sm_count():
-                if _is_hip:
+                if self.paged_mqa_logits_backend.is_torch():
+                    logits_chunk = fp8_ragged_mqa_logits_torch_dsa(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        chunk_rows=envs.SGLANG_DSA_TORCH_FALLBACK_CHUNK_ROWS.get(),
+                        clean_logits=False,
+                    )
+                elif self.paged_mqa_logits_backend.is_triton():
+                    logits_chunk = fp8_mqa_logits_triton(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
+                    )
+                elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
