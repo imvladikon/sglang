@@ -23,7 +23,8 @@ class _FakeReq:
         self.mamba_pool_idx = None
         self.to_finish = None
         self._finished = False
-        self.kv = SimpleNamespace(holds_kv=True)
+        # Mirrors Req.kv; the abort paths read only these two predicates.
+        self.kv = SimpleNamespace(holds_kv=True, holds_mamba=False)
 
     def finished(self):
         return self._finished
@@ -36,9 +37,9 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.waiting_queue = []
     sched.dllm_config = None
     sched.grammar_manager = Mock()
-    sched.mm_receiver = None
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
+    sched.mm_receiver = None
     sched.ps = SimpleNamespace(pp_size=1)
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
     sched.last_batch = None
