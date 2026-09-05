@@ -230,6 +230,19 @@ class DSATopKBackend(Enum):
                 )
             raise RuntimeError(f"Unsupported {topk_transform_method = }.")
 
+        if self.is_torch():
+            return _topk_transform_torch(
+                logits=logits,
+                lengths=lengths,
+                topk=topk,
+                topk_transform_method=topk_transform_method,
+                attn_metadata=attn_metadata,
+                cu_seqlens_q_topk=cu_seqlens_q_topk,
+                topk_indices_offset=topk_indices_offset,
+                row_starts=row_starts,
+                batch_idx_list=batch_idx_list,
+            )
+
         raise RuntimeError(f"Unsupported {self = } for SGLANG_DSA_FUSE_TOPK.")
 
 
@@ -271,6 +284,76 @@ def _topk_unfused(
     topk_indices[:, :valid_topk] = topk_local_indices
 
     return topk_indices
+
+
+def _topk_transform_torch(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    topk_transform_method: TopkTransformMethod,
+    attn_metadata,
+    cu_seqlens_q_topk: Optional[torch.Tensor],
+    topk_indices_offset: Optional[torch.Tensor],
+    row_starts: Optional[torch.Tensor],
+    batch_idx_list: Optional[List[int]],
+) -> torch.Tensor:
+    """Reference top-k selection plus the attention backend's index transform.
+
+    This is the correctness fallback for devices that cannot run the fused DSA
+    top-k kernels.  The returned values have the same contract as the fused
+    SGL/FlashInfer paths: physical page-size-1 KV slots for PAGED attention and
+    flattened-KV offsets for RAGGED attention.
+    """
+    local_indices = _topk_unfused(
+        logits, lengths, topk, row_starts=row_starts, topk_op=torch.topk
+    )
+    valid = local_indices >= 0
+
+    if topk_transform_method == TopkTransformMethod.RAGGED:
+        if topk_indices_offset is None:
+            raise RuntimeError(
+                "RAGGED topk_transform requires topk_indices_offset; "
+                "expected extend-without-speculative metadata."
+            )
+        offsets = topk_indices_offset.to(
+            dtype=torch.int32, device=logits.device
+        ).unsqueeze(1)
+        return torch.where(valid, local_indices + offsets, local_indices)
+
+    if topk_transform_method == TopkTransformMethod.PAGED:
+        page_table = attn_metadata.page_table_1
+        if page_table is None:
+            raise RuntimeError("Torch PAGED topk_transform requires page_table_1.")
+        row_to_batch, page_table_row_starts = _build_flashinfer_paged_args(
+            attn_metadata=attn_metadata,
+            row_starts=row_starts,
+            cu_seqlens_q_topk=cu_seqlens_q_topk,
+            batch_idx_list=batch_idx_list,
+            device=logits.device,
+            num_rows=logits.shape[0],
+        )
+        if row_to_batch is not None:
+            page_table = page_table[row_to_batch.to(torch.long)]
+        elif page_table.shape[0] != logits.shape[0]:
+            raise RuntimeError(
+                "Torch PAGED topk_transform cannot infer a page-table row for "
+                f"{logits.shape[0]} logit rows and {page_table.shape[0]} requests."
+            )
+
+        page_columns = local_indices
+        if page_table_row_starts is not None:
+            page_columns = page_columns + page_table_row_starts.to(
+                dtype=torch.int32, device=logits.device
+            ).unsqueeze(1)
+        safe_page_columns = torch.where(
+            valid, page_columns, torch.zeros_like(page_columns)
+        )
+        physical_indices = torch.gather(
+            page_table, dim=1, index=safe_page_columns.to(torch.long)
+        )
+        return torch.where(valid, physical_indices, local_indices)
+
+    raise RuntimeError(f"Unsupported {topk_transform_method = }.")
 
 
 def _topk_transform_v2_paged(

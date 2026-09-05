@@ -233,6 +233,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Preserve -1 padding sentinels: chunk_gated_delta_rule_fwd_h masks both
+        # state loads and stores for them.
         return chunk_kda(
             q=q,
             k=k,

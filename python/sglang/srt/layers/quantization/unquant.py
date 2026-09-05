@@ -774,7 +774,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         block layout. During weight update, checkpoint tensors are in
         canonical layout and need a temporary shape restore for copy.
         """
-        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+        # Keep this guard aligned with process_weights_after_loading: every
+        # TRT-LLM MoE runner variant repacks BF16 expert weights into block
+        # layout, so every variant must restore the canonical checkpoint shape
+        # before a hot update. Restricting this to the routed variant breaks
+        # plain flashinfer_trtllm on Blackwell during RL weight synchronization.
+        if not self.use_flashinfer_trtllm_moe:
             return
 
         expected_shape = None

@@ -67,7 +67,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     resolve_mxfp8_dense_gemm_backend,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    prepare_fp8_layer_for_marlin,
+    prepare_moe_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -1118,6 +1121,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        # Ampere can store official E4M3 checkpoints but cannot execute the raw
+        # FP8 Triton MoE kernel. Repack the experts for weight-only W8A16
+        # Marlin, matching the existing dense FP8 fallback.
+        self.use_marlin = False
+        if _is_cuda and not self.is_fp4_expert:
+            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            self.use_marlin = force_marlin or can_auto_enable_marlin_fp8()
         # The MxFP4 wrapper methods borrow this instance for weight loading;
         # they never call create_moe_runner, so moe_runner_config is unset.
         self._owns_moe_runner = False
@@ -1177,6 +1187,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
         """
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        layer.orig_dtype = params_dtype
 
         if is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
@@ -1470,6 +1482,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._ensure_cutlass_buffers_initialized(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.use_marlin:
+            layer.weight_block_size = self.quant_config.weight_block_size
+            prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
+            return
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
@@ -1633,8 +1650,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_input_scale = None
                 layer.w2_input_scale = None
             runner_is_aiter = (
-                getattr(self, "runner", None) is not None
-                and self.runner.runner_backend.is_aiter()
+                self._owns_moe_runner and self.runner.runner_backend.is_aiter()
             )
             if _use_aiter and runner_is_aiter:
                 layer.w13_weight.data = shuffle_weight(
@@ -1674,14 +1690,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale, requires_grad=False
             )
             layer.w2_input_scale = None
-            if _use_aiter:
+            runner_is_aiter = (
+                self._owns_moe_runner and self.runner.runner_backend.is_aiter()
+            )
+            if _use_aiter and runner_is_aiter:
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
                 )
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
-        elif _use_aiter:
+        elif (
+            _use_aiter
+            and self._owns_moe_runner
+            and self.runner.runner_backend.is_aiter()
+        ):
             # Pre-shuffle weights
             t = shuffle_weight(layer.w13_weight, (16, 16))
             layer.w13_weight.copy_(t)
@@ -2222,6 +2245,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
 
+        if self.use_marlin and not self.block_quant:
+            prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
+
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
 
@@ -2398,6 +2424,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
+        if self.use_marlin:
+            moe_runner_backend = MoeRunnerBackend.MARLIN
+
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
@@ -2414,6 +2443,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_aiter()
+            or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
@@ -2681,6 +2711,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)
+        elif self.runner.runner_backend.is_marlin():
+            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+            expert_map = None
+            global_num_experts = -1
+            if hasattr(layer, "dispatcher") and hasattr(
+                layer.dispatcher, "local_expert_mapping"
+            ):
+                expert_map = layer.dispatcher.local_expert_mapping
+                if expert_map is not None:
+                    global_num_experts = self.moe_runner_config.num_experts
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=8,
+                is_fp8=True,
+                expert_map=expert_map,
+                global_num_experts=global_num_experts,
+            )
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
         else:

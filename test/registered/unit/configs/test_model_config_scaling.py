@@ -2,7 +2,11 @@ import math
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.model_config import ModelConfig, compute_mla_mscale_scaling
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    compute_mla_mscale_scaling,
+    resolve_spec_hidden_size,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -117,6 +121,39 @@ class TestInitMlaScaling(CustomTestCase):
         config._derive_model_shapes()
 
         self.assertEqual(config.scaling, 1 / math.sqrt(256))
+
+
+class TestSpecHiddenSize(CustomTestCase):
+    def test_glm5_next_mhc_keeps_wide_residual_but_contracts_spec_stream(self):
+        text_config = SimpleNamespace(model_type="glm5_next_text", mhc=True)
+        hf_config = SimpleNamespace(model_type="glm5_next", text_config=text_config)
+
+        self.assertEqual(
+            resolve_spec_hidden_size(hf_config, hidden_size=6144, hc_mult=4),
+            (6144, 24576),
+        )
+
+    def test_glm5_next_non_mhc_ignores_published_hc_mult(self):
+        text_config = SimpleNamespace(model_type="glm5_next_text", mhc=False)
+        hf_config = SimpleNamespace(model_type="glm5_next", text_config=text_config)
+
+        self.assertEqual(
+            resolve_spec_hidden_size(hf_config, hidden_size=6144, hc_mult=4),
+            (6144, None),
+        )
+
+    def test_deepseek_v4_and_hyv4_keep_distinct_spec_contracts(self):
+        deepseek = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        hyv4 = SimpleNamespace(architectures=["HYV4ForCausalLM"])
+
+        self.assertEqual(
+            resolve_spec_hidden_size(deepseek, hidden_size=2816, hc_mult=4),
+            (11264, 11264),
+        )
+        self.assertEqual(
+            resolve_spec_hidden_size(hyv4, hidden_size=2816, hc_mult=4),
+            (2816, None),
+        )
 
 
 if __name__ == "__main__":

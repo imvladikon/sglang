@@ -185,7 +185,9 @@ def get_default_hidden_dim(
     elif module_name == "gate_up_proj":
         inter = config.intermediate_size
         first_k = getattr(config, "first_k_dense_replace", None)
-        moe_freq = getattr(config, "moe_layer_freq", 1)
+        # Some released MoE configs serialize this optional value as null.
+        # Semantically that still means every post-prefix layer is sparse.
+        moe_freq = getattr(config, "moe_layer_freq", 1) or 1
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
             moe_inter = getattr(config, "moe_intermediate_size", None)
             n_shared = getattr(config, "n_shared_experts", None)
@@ -195,7 +197,7 @@ def get_default_hidden_dim(
     elif module_name == "down_proj":
         inter = config.intermediate_size
         first_k = getattr(config, "first_k_dense_replace", None)
-        moe_freq = getattr(config, "moe_layer_freq", 1)
+        moe_freq = getattr(config, "moe_layer_freq", 1) or 1
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
             moe_inter = getattr(config, "moe_intermediate_size", None)
             n_shared = getattr(config, "n_shared_experts", None)
@@ -236,6 +238,23 @@ def get_default_hidden_dim(
             return config.hidden_size, get_dsa_index_head_dim(config)
         else:  # indexer.weights_proj
             return config.hidden_size, get_dsa_index_n_heads(config)
+    elif module_name in KDA_GATE_LORA_NAMES:
+        linear_config = getattr(config, "linear_attn_config", None) or {}
+        num_heads = linear_config.get("num_heads") or getattr(
+            config, "linear_num_heads", None
+        )
+        head_dim = linear_config.get("head_dim") or getattr(
+            config, "linear_head_dim", None
+        )
+        if num_heads is None or head_dim is None:
+            raise ValueError(
+                f"{module_name} LoRA geometry requires KDA num_heads and head_dim"
+            )
+        if module_name in {"f_a_proj", "g_a_proj"}:
+            return config.hidden_size, head_dim
+        if module_name in {"f_b_proj", "g_b_proj"}:
+            return head_dim, num_heads * head_dim
+        return config.hidden_size, num_heads
     elif module_name == "gate_up_proj_moe":
         moe_inter = (
             getattr(config, "moe_intermediate_size", None) or config.intermediate_size
@@ -366,10 +385,26 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
 )
+KDA_GATE_LORA_NAMES = frozenset(
+    {"b_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj"}
+)
+
+
+def _model_declares_scoped_lora_target(
+    model: "torch.nn.Module", module_name: str
+) -> bool:
+    """Prevent architecture-specific leaf names leaking into generic `all`."""
+    if module_name not in KDA_GATE_LORA_NAMES:
+        return True
+    return module_name in set(getattr(model, "supported_lora_modules", ()))
+
+
 REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
     "fc2_latent_proj",
+    "f_a_proj",
+    "g_a_proj",
     *DSA_INDEXER_LORA_NAMES,
 ]
 # Attention-projection LoRA modules shard on the attention-TP group, which
@@ -388,6 +423,9 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "wo_ud",
         "in_proj",
         "in_proj_qkvz",
+        "b_proj",
+        "f_b_proj",
+        "g_b_proj",
     }
 )
 
@@ -402,6 +440,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
+        *KDA_GATE_LORA_NAMES,
         "up_proj",
         "gate_up_proj",
         "down_proj",
@@ -454,6 +493,8 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
                 # Bare DSA indexer leaf names are ambiguous across model
                 # families. Only auto-detect them when the actual module path
                 # proves they are under an `indexer` parent.
+                continue
+            elif not _model_declares_scoped_lora_target(model, leaf_name):
                 continue
             else:
                 raw_names.add(leaf_name)

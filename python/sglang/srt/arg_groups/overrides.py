@@ -512,6 +512,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Lfm2ForCausalLM",
         "Lfm2MoeForCausalLM",
         "ZayaForCausalLM",
+        "Glm5NextForConditionalGeneration",
     }
 )
 
@@ -533,6 +534,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "BailingMoeV3ForCausalLM",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
@@ -757,6 +759,13 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     if not user_set_prefill and not user_set_decode and get_platform().is_hip:
         declared["dsa_prefill_backend"] = "tilelang"
         declared["dsa_decode_backend"] = "tilelang"
+    elif major < 9:
+        # Sparse CUDA kernels require Hopper or newer. Keep an exact eager
+        # reference path for compact development models on Ampere.
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "torch"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "torch"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
@@ -792,6 +801,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
@@ -1087,6 +1097,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "Glm4MoeLiteForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ]
     except Exception:
         return False
@@ -1550,6 +1561,48 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
     return {}
+
+
+_TOPK_BYPASSING_MOE_RUNNER_BACKENDS = frozenset(
+    {
+        "flashinfer_trtllm",
+        "experimental_sgl_trtllm",
+        "triton_kernel",
+    }
+)
+
+
+@register_post_process
+def _routed_experts_capture_backend_guard(view: Any) -> dict:
+    """Reject MoE runners that cannot return real per-token expert ids.
+
+    These fused runners bypass TopK materialization, so routed-expert capture
+    would otherwise return the zero-initialized host buffer. That is silent
+    data corruption for routing-replay training, and on a large EP model it
+    later surfaces as invalid all-to-all split sizes.
+    """
+    if not view.enable_return_routed_experts:
+        return {}
+    if view.moe_runner_backend == "experimental_sgl_trtllm" and getattr(
+        view, "enable_lora", False
+    ):
+        return {}
+    if view.moe_runner_backend not in _TOPK_BYPASSING_MOE_RUNNER_BACKENDS:
+        return {}
+    if view.quantization in (None, "fp8"):
+        logger.warning(
+            "--enable-return-routed-experts cannot capture routed experts "
+            "under moe_runner_backend=%r because TopK ids are bypassed; "
+            "falling back to moe_runner_backend='auto'.",
+            view.moe_runner_backend,
+        )
+        return {"moe_runner_backend": "auto"}
+    raise ValueError(
+        "--enable-return-routed-experts is incompatible with "
+        f"moe_runner_backend={view.moe_runner_backend!r}: the runner does not "
+        "materialize per-token TopK ids and there is no safe automatic "
+        f"fallback for quantization={view.quantization!r}."
+    )
 
 
 @register_post_process

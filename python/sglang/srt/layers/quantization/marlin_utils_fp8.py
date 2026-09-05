@@ -8,6 +8,7 @@ import torch
 from sglang.srt.layers.quantization.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
     marlin_make_workspace,
+    marlin_permute_bias,
     marlin_permute_scales,
     should_use_atomic_add_reduce,
 )
@@ -121,7 +122,9 @@ def prepare_fp8_layer_for_marlin(
     device = layer.weight.device
 
     # WORKSPACE
-    layer.workspace = marlin_make_workspace(device)
+    layer.workspace = marlin_make_workspace(
+        device, existing=getattr(layer, "workspace", None)
+    )
 
     # WEIGHT
     # Repack weights to marlin format
@@ -192,6 +195,139 @@ def prepare_fp8_layer_for_marlin(
         assert layer.bias.shape == (part_size_n,)
         layer.bias = torch.nn.Parameter(layer.bias.detach(), requires_grad=False)
 
+
+def prepare_moe_fp8_layer_for_marlin(
+    layer: torch.nn.Module, size_k_first: bool = True
+) -> None:
+    logger.warning_once(
+        "Your GPU does not have native support for FP8 computation but "
+        "FP8 quantization is being used. Weight-only FP8 compression will "
+        "be used leveraging the Marlin kernel. This may degrade "
+        "performance for compute-heavy workloads."
+    )
+
+    # EP keeps only local experts in the weight tensors. Using the global
+    # expert count here over-iterates and produces an invalid packed layout.
+    e = layer.w13_weight.shape[0]
+    k = layer.hidden_size
+    n = layer.intermediate_size_per_partition
+    weight_block_size = getattr(layer, "weight_block_size", None)
+
+    # WORKSPACE
+    device = layer.w13_weight.device
+    layer.workspace = marlin_make_workspace(
+        device, 4, existing=getattr(layer, "workspace", None)
+    )
+    perm = torch.empty(0, dtype=torch.int, device=device)
+
+    # WEIGHT
+    # Repack weights to marlin format
+    for name in ["w13_weight", "w2_weight"]:
+        weight = getattr(layer, name)
+        tensor_list = []
+        if "w13" in name:
+            size_n, size_k = n * 2, k
+        else:
+            size_n, size_k = k, n
+
+        if size_k_first:
+            assert weight.shape == (e, size_k, size_n)
+        else:
+            assert weight.shape == (e, size_n, size_k)
+
+        for i in range(e):
+            qweight = pack_fp8_to_int32(weight[i], size_k_first)
+            if not size_k_first:
+                qweight = qweight.T.contiguous()
+
+            marlin_qweight = gptq_marlin_repack(
+                b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
+            )
+            tensor_list.append(marlin_qweight)
+
+        weight = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+        weight = torch.nn.Parameter(weight, requires_grad=False)
+
+        setattr(layer, name, weight)
+
+    # WEIGHT SCALES
+    # Permute scales
+    group_size = -1 if weight_block_size is None else weight_block_size[1]
+
+    for name in ["w13", "w2"]:
+        if name + "_weight_scale" in dir(layer):
+            new_name = name + "_weight_scale"
+            scales = getattr(layer, new_name).to(layer.orig_dtype)
+            delattr(layer, new_name)
+        elif name + "_weight_scale_inv" in dir(layer):
+            new_name = name + "_weight_scale_inv"
+            scales = getattr(layer, new_name).to(layer.orig_dtype)
+            delattr(layer, new_name)
+
+        tensor_list = []
+        if "w13" in name:
+            size_n, size_k = n * 2, k
+        else:
+            size_n, size_k = k, n
+
+        # marlin kernel only support channel-wise and group-wise quantization
+        # we need to convert the scales
+        if weight_block_size is None:
+            if scales.nelement() == e:
+                # tensor-wise quantization -> channel-wise quantization
+                # (e, 1, 1) =>(repeat)=> (e, 1, size_n)
+                scales = scales.view(e, 1, 1).repeat_interleave(size_n, 2)
+            elif scales.nelement() > e and scales.nelement() != e * size_n:
+                assert (e * size_n) % scales.nelement() == 0
+                s_size = scales.nelement() // e
+                # tensor-wise quantization (for gate-up proj)
+                #     -> channel-wise quantization
+                # (e, 1, s_size) =>(repeat)=> (e, 1, size_n)
+                scales = scales.view(e, 1, s_size)
+                scales = scales.repeat_interleave(size_n // s_size, 2)
+            else:
+                # channel-wise quantization
+                # (e, 1, size_n)
+                scales = scales.view(e, 1, size_n)
+        else:
+            # block-wise quantization -> group-wise quantization
+            # (e, size_k // block_size[1], ceil(size_n / block_size[0]))
+            #  =>(repeat)=> (e, size_k // block_size[1], size_n)
+            if not size_k_first:
+                scales = scales.permute(0, 2, 1)
+            block_n = weight_block_size[0]
+            scales = scales.repeat_interleave(block_n, 2)
+            # size_n may not divisible by block_size[0]
+            scales = scales[..., :size_n].contiguous()
+
+        for i in range(e):
+            marlin_scales = marlin_permute_scales(
+                s=scales[i], size_k=size_k, size_n=size_n, group_size=group_size
+            )
+            tensor_list.append(marlin_scales)
+
+        scales = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+        scales = fp8_fused_exponent_bias_into_scales(scales)
+        scales = torch.nn.Parameter(scales, requires_grad=False)
+
+        setattr(layer, name + "_weight_scale", scales)
+
+    # BIAS
+    # Permute bias
+    for name in ["w13_bias", "w2_bias"]:
+        if not hasattr(layer, name):
+            continue
+        bias = getattr(layer, name).to(layer.orig_dtype)
+
+        tensor_list = []
+        for i in range(e):
+            expert_bias = bias[i]
+
+            tensor_list.append(marlin_permute_bias(expert_bias))
+
+        bias = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+        bias = torch.nn.Parameter(bias, requires_grad=False)
+        setattr(layer, name, bias)
 
 def pack_fp8_to_int32(
     fp8_tensor: torch.Tensor, size_k_first: bool = True

@@ -276,13 +276,20 @@ def align_fp8_moe_weights_for_flashinfer_trtllm(
         for i in range(num_experts)
     ]
 
-    layer.w13_weight = Parameter(
+    # Keep the original Parameters: FusedMoE attaches its expert-aware
+    # weight_loader (plus sharding metadata) directly to these objects.  A new
+    # bare Parameter works for the initial forward but breaks the first RL hot
+    # update, where model.load_weights must route each expert shard through that
+    # loader.
+    copy_or_rebind_param(
+        layer,
+        "w13_weight",
         torch.stack(w13_shuffled).view(torch.float8_e4m3fn),
-        requires_grad=False,
     )
-    layer.w2_weight = Parameter(
+    copy_or_rebind_param(
+        layer,
+        "w2_weight",
         torch.stack(w2_shuffled).view(torch.float8_e4m3fn),
-        requires_grad=False,
     )
 
     # Precompute and register per-expert output scaling factors for FI MoE.
@@ -657,7 +664,6 @@ def get_activation_type(activation: str, is_gated: bool = True) -> int:
         _ACTIVATION_STR_TO_TYPE = {
             "silu": ActivationType.Swiglu,
             "gelu": ActivationType.Geglu,
-            "situ": ActivationType.Situ,
         }
     else:
         _ACTIVATION_STR_TO_TYPE = {

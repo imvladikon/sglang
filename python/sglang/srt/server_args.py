@@ -1785,6 +1785,7 @@ class ServerArgs:
         Arg(
             help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
             choices=[
+                "torch",
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
                 "flashmla_kv",
@@ -1816,6 +1817,7 @@ class ServerArgs:
         Arg(
             help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
             choices=[
+                "torch",
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
                 "flashmla_kv",
@@ -1841,7 +1843,7 @@ class ServerArgs:
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. On non-gfx95 ROCm GPUs, 'sgl-kernel' falls back to the portable 'torch' backend with fused top-k disabled. The 'torch' backend otherwise requires SGLANG_DSA_FUSE_TOPK=false.",
             choices=["sgl-kernel", "torch", "flashinfer"],
         ),
         NS("exec.kernel"),
@@ -3927,6 +3929,7 @@ class ServerArgs:
             default=argparse.SUPPRESS,
             type=str,
             choices=[
+                "torch",
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
                 "flashmla_kv",
@@ -3947,6 +3950,7 @@ class ServerArgs:
             default=argparse.SUPPRESS,
             type=str,
             choices=[
+                "torch",
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
                 "flashmla_kv",

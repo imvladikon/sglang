@@ -658,6 +658,12 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        # configure_subprocess() installed the preload hook around Process.start(),
+        # but Python state is inherited under fork. Co-located trainer imports
+        # (notably Megatron) can mutate the global TMS singleton to hook_mode="torch"
+        # while the runner is being initialized. Restore preload mode at the last
+        # boundary before load_model() enters the first TMS allocation region.
+        self.memory_saver_adapter.configure_current_process()
         self.load_model()
         prepare_moe_topk(
             model=self.model,
@@ -1741,7 +1747,7 @@ class ModelRunner:
                 )
             else:
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
-                pool.mamba_pool.copy_from(
+                pool.copy_mamba_state(
                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )
@@ -1964,9 +1970,16 @@ class ModelRunner:
             forward_batch.token_ids_logprobs,
         )
 
-    def check_weights(self, action: str, allow_quant_error: bool = False):
+    def check_weights(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_prefixes=(),
+    ):
         return self._weight_checker.handle(
-            action=action, allow_quant_error=allow_quant_error
+            action=action,
+            allow_quant_error=allow_quant_error,
+            skip_prefixes=skip_prefixes,
         )
 
     def _expand_eplb_metadata_for_scale(
