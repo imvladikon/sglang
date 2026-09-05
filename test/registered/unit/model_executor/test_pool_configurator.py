@@ -721,12 +721,14 @@ class TestEagleConfigurator(CustomTestCase):
                 self.assertLessEqual(used, available)
 
     def test_hybrid_swa_scales_draft_budget_with_dcp(self):
+        ratio = 0.5
         mr = _make_model_runner(
             self,
             is_hybrid_swa=True,
             full_attention_layer_ids=list(range(16)),
             swa_attention_layer_ids=list(range(16, 32)),
             swa_num_kv_heads=4,
+            swa_full_tokens_ratio=ratio,
         )
         mr.spec_algorithm.is_eagle.return_value = True
         mr.spec_algorithm.is_none.return_value = False
@@ -746,7 +748,7 @@ class TestEagleConfigurator(CustomTestCase):
 
                 expected = (
                     full_pt * (16 + 4 * dcp_size)
-                    + mr.server_args.swa_full_tokens_ratio * swa_pt * 16
+                    + ratio * swa_pt * 16
                 )
                 self.assertEqual(cfg._cell_size, expected)
 
