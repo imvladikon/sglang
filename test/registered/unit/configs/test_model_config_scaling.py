@@ -1,7 +1,12 @@
 import math
 import unittest
+from types import SimpleNamespace
 
-from sglang.srt.configs.model_config import ModelConfig, compute_mla_mscale_scaling
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    compute_mla_mscale_scaling,
+    resolve_spec_hidden_size,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -91,6 +96,64 @@ class TestInitMlaScaling(CustomTestCase):
     def test_no_rope_scaling_keeps_base(self):
         base, scaling = _mla_scaling(None)
         self.assertEqual(scaling, base)
+
+    def test_hyv4_shape_derivation_uses_rope_parameters(self):
+        hf_config = SimpleNamespace(
+            architectures=["HYV4ForCausalLM"],
+            model_type="hy_v4",
+            hidden_size=2816,
+            num_hidden_layers=34,
+            num_attention_heads=32,
+            vocab_size=120832,
+            head_dim=64,
+            v_head_dim=256,
+            kv_lora_rank=512,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+            index_topk=2048,
+            index_head_dim=128,
+            rope_parameters={"rope_theta": 10_000_000, "rope_type": "default"},
+        )
+        config = ModelConfig.__new__(ModelConfig)
+        config.hf_config = hf_config
+        config.hf_text_config = hf_config
+
+        config._derive_model_shapes()
+
+        self.assertEqual(config.scaling, 1 / math.sqrt(256))
+
+
+class TestSpecHiddenSize(CustomTestCase):
+    def test_glm5_next_mhc_keeps_wide_residual_but_contracts_spec_stream(self):
+        text_config = SimpleNamespace(model_type="glm5_next_text", mhc=True)
+        hf_config = SimpleNamespace(model_type="glm5_next", text_config=text_config)
+
+        self.assertEqual(
+            resolve_spec_hidden_size(hf_config, hidden_size=6144, hc_mult=4),
+            (6144, 24576),
+        )
+
+    def test_glm5_next_non_mhc_ignores_published_hc_mult(self):
+        text_config = SimpleNamespace(model_type="glm5_next_text", mhc=False)
+        hf_config = SimpleNamespace(model_type="glm5_next", text_config=text_config)
+
+        self.assertEqual(
+            resolve_spec_hidden_size(hf_config, hidden_size=6144, hc_mult=4),
+            (6144, None),
+        )
+
+    def test_deepseek_v4_and_hyv4_keep_distinct_spec_contracts(self):
+        deepseek = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        hyv4 = SimpleNamespace(architectures=["HYV4ForCausalLM"])
+
+        self.assertEqual(
+            resolve_spec_hidden_size(deepseek, hidden_size=2816, hc_mult=4),
+            (11264, 11264),
+        )
+        self.assertEqual(
+            resolve_spec_hidden_size(hyv4, hidden_size=2816, hc_mult=4),
+            (2816, None),
+        )
 
 
 if __name__ == "__main__":
