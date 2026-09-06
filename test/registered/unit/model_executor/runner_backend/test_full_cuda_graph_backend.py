@@ -111,6 +111,20 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         self.assertEqual(backend._graphs[shape_key], "GRAPH")
         self.assertIs(backend._outputs[shape_key], sentinel_out)
 
+    def test_memory_saver_capture_preserves_graph_pool_contents(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        backend = _make_backend(runner)
+        adapter = SimpleNamespace(
+            enabled=True,
+            cuda_graph=mock.Mock(side_effect=lambda **kw: _FakeGraphCtx()),
+        )
+        backend._memory_saver_adapter = adapter
+
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+            backend.capture_one(ShapeKey(size=1), mock.Mock(return_value=object()))
+
+        self.assertTrue(adapter.cuda_graph.call_args.kwargs["enable_cpu_backup"])
+
     def test_prefill_shapes_share_one_output_storage(self):
         runner = _make_runner(enable_profile=False, profiler=None, mode_name="EXTEND")
         backend = _make_backend(runner)

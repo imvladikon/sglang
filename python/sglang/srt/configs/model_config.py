@@ -138,6 +138,8 @@ def is_deepseek_dsa(config) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "GlmMoeDsaForCausalLMNextN",
+            "Glm5NextForConditionalGenerationNextN",
+            "Glm5NextForConditionalGeneration",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
             "Dots3NoteForCausalLM",
@@ -154,6 +156,31 @@ def is_kimi_k3(config) -> bool:
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
+
+
+def uses_kda_attention(config) -> bool:
+    configs = [config]
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        configs.append(get_text_config())
+    else:
+        text_config = _hf_attr(config, "text_config")
+        if text_config is not None:
+            configs.append(text_config)
+    for config in configs:
+        linear_attn_config = _hf_attr(config, "linear_attn_config")
+        if isinstance(linear_attn_config, dict) and linear_attn_config.get(
+            "kda_layers"
+        ):
+            return True
+        layer_types = _hf_attr(config, "layer_types") or []
+        if (
+            "linear_attention" in layer_types
+            and _hf_attr(config, "linear_num_heads") is not None
+            and _hf_attr(config, "linear_head_dim") is not None
+        ):
+            return True
+    return False
 
 
 def is_dspark_draft(config) -> bool:
@@ -180,8 +207,20 @@ def is_deepseek_v4(config) -> bool:
 def resolve_spec_hidden_size(
     hf_config, hidden_size: int, hc_mult: int
 ) -> tuple[int, Optional[int]]:
-    # Only DSV4 carries the hc-flattened stream across the target→draft
-    # boundary; other hc models (hy_v4) collapse to hidden_size first.
+    text_config = _hf_attr(hf_config, "text_config") or hf_config
+    is_glm5_next = _hf_attr(hf_config, "model_type") == "glm5_next" or (
+        _hf_attr(text_config, "model_type") == "glm5_next_text"
+    )
+    if is_glm5_next:
+        # GLM-5.3 carries an mHC residual stream internally, but contracts it
+        # before the target-to-draft boundary. Published non-mHC checkpoints
+        # may still retain hc_mult, so do not allocate a widened stream.
+        if hc_mult <= 1 or not _hf_attr(text_config, "mhc"):
+            return hidden_size, None
+        return hidden_size, hidden_size * hc_mult
+
+    # Only DSV4 carries the hc-flattened stream across the target-to-draft
+    # boundary; other hc models (for example HYV4) collapse first.
     if hc_mult <= 1 or not is_deepseek_v4(hf_config):
         return hidden_size, None
     hc_hidden_size = hidden_size * hc_mult
@@ -283,6 +322,21 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads
+
+
+def get_dsa_index_kpool(config: PretrainedConfig) -> int:
+    return getattr(config, "index_kpool", 1)
+
+
+def get_dsa_mtp_topk_width(config: PretrainedConfig) -> int:
+    """MTP seeds include index_topk pooled tokens plus up to index_kpool - 1 tail tokens."""
+    index_kpool = get_dsa_index_kpool(config)
+    assert index_kpool >= 1, f"index_kpool must be positive, got {index_kpool}"
+    return get_dsa_index_topk(config) + index_kpool - 1
+
+
+def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:
+    return getattr(config, "index_kpool_compress", False)
 
 
 REQUANTIZATION_METHODS = ["quark_mxfp4"]
@@ -731,6 +785,15 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "Glm4MoeLiteForCausalLMNextN"
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        ):
+            self.hf_config.architectures[0] = "Glm5NextForConditionalGenerationNextN"
+            self.hf_text_config.architectures = list(self.hf_config.architectures)
+            self.hf_text_config.num_nextn_predict_layers = 1
+            self.hf_text_config.linear_attn_config = None
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "GlmOcrForConditionalGeneration",
         ]:
@@ -968,6 +1031,8 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLMNextN" in self.hf_config.architectures
+            or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
+            or "Glm5NextForConditionalGenerationNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "HYV4ForCausalLM" in self.hf_config.architectures
@@ -1085,7 +1150,10 @@ class ModelConfig:
             self.v_head_dim = self.hf_config.v_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-        elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
+        elif (
+            "SarvamMLAForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
+        ):
             self.head_dim = (
                 self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
             )
@@ -1950,6 +2018,7 @@ multimodal_model_archs = [
     "Gemma4UnifiedForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "Glm5NextForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "GlmImageForConditionalGeneration",
@@ -2017,6 +2086,7 @@ piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLMNextN",
     "DeepseekV4ForCausalLMDSpark",
     "Qwen3NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
 ]

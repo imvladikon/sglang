@@ -222,6 +222,7 @@ class BaseTpWorker(ABC):
         success, message = self.model_runner.weight_updater.update_weights_from_tensor(
             named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
             load_format=recv_req.load_format,
+            finalize=recv_req.flush_cache,
         )
         return success, message
 

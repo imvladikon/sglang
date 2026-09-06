@@ -242,6 +242,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
        fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' pyproject.toml && \
+           sed -i '/cuda-toolkit\[cccl,nvcc\]==13\.0\.3/d' pyproject.toml && \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
@@ -640,6 +641,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
+           sed -i '/cuda-toolkit\[cccl,nvcc\]==13\.0\.3/d' python/pyproject.toml && \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
        fi \

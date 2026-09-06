@@ -2469,6 +2469,56 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
+    def test_routed_experts_capture_rejects_topk_bypassing_runner(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _routed_experts_capture_backend_guard,
+        )
+
+        def _view(**kw):
+            defaults = {
+                "enable_return_routed_experts": True,
+                "moe_runner_backend": "flashinfer_trtllm",
+                "quantization": "fp8",
+            }
+            defaults.update(kw)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        self.assertEqual(
+            _routed_experts_capture_backend_guard(_view()),
+            {"moe_runner_backend": "auto"},
+        )
+        with self.assertRaisesRegex(ValueError, "does not materialize"):
+            _routed_experts_capture_backend_guard(
+                _view(quantization="modelopt_fp4")
+            )
+        self.assertEqual(
+            _routed_experts_capture_backend_guard(
+                _view(moe_runner_backend="triton")
+            ),
+            {},
+        )
+        # Current main materializes STANDARD TopK for FP4 experts under this
+        # runner, so the older Miles-wide blacklist would be over-restrictive.
+        self.assertEqual(
+            _routed_experts_capture_backend_guard(
+                _view(
+                    moe_runner_backend="flashinfer_mxfp4",
+                    quantization="modelopt_fp4",
+                )
+            ),
+            {},
+        )
+        self.assertEqual(
+            _routed_experts_capture_backend_guard(
+                _view(
+                    moe_runner_backend="experimental_sgl_trtllm",
+                    enable_lora=True,
+                )
+            ),
+            {},
+        )
+
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
 

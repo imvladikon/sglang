@@ -37,11 +37,34 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
+    is_gfx95_supported,
+    is_hip,
     is_mps,
     parse_connector_type,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def handle_rocm_dsa_topk_compatibility(server_args: Any) -> None:
+    """Use the portable DSA top-k path where the fused transform is unavailable."""
+    if not is_hip() or is_gfx95_supported():
+        return
+
+    cfg = resolving_view(server_args)
+    if cfg.dsa_topk_backend != "sgl-kernel":
+        return
+
+    envs.SGLANG_DSA_FUSE_TOPK.set(False)
+    declare_resolution(
+        server_args,
+        "_handle_rocm_dsa_topk_compatibility",
+        dsa_topk_backend="torch",
+    )
+    logger.warning(
+        "Use the portable Torch DSA top-k backend with fused top-k disabled "
+        "on non-gfx95 ROCm GPUs."
+    )
 
 
 def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
@@ -81,7 +104,6 @@ def _rocm_fp8_wo_a_supported() -> bool:
 
 
 def handle_model_specific_adjustments(server_args: Any):
-
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         get_mimo_v2_fused_qkv_expected_tp_size,
@@ -183,6 +205,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
@@ -343,6 +366,9 @@ def handle_model_specific_adjustments(server_args: Any):
                 # above `set`s the variable unconditionally, so this has
                 # to follow it.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(True)
+                # The fused kernel is unavailable on older ROCm targets. Keep
+                # the portable Torch fallback there while enabling v2 on gfx95.
+                handle_rocm_dsa_topk_compatibility(server_args)
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
@@ -877,7 +903,6 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
 
 
 def handle_language_model_only(server_args: Any):
-
     cfg = resolving_view(server_args)
     if not cfg.language_model_only:
         return

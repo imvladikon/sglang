@@ -530,6 +530,16 @@ def handle_deterministic_inference(server_args: Any):
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
 
     if cfg.enable_deterministic_inference:
+        if (
+            "SGLANG_DSA_FUSE_TOPK" not in os.environ
+            and "SGLANG_NSA_FUSE_TOPK" not in os.environ
+        ):
+            envs.SGLANG_DSA_FUSE_TOPK.set(False)
+            logger.warning(
+                "SGLANG_DSA_FUSE_TOPK=0 forced for deterministic inference "
+                "to avoid the fused KPool tail transform."
+            )
+
         if cfg.enable_aiter_allreduce_fusion:
             logger.warning(
                 "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
@@ -564,6 +574,7 @@ def handle_deterministic_inference(server_args: Any):
                     "PixtralForConditionalGeneration",
                     "GlmMoeDsaForCausalLM",
                     "Glm4MoeLiteForCausalLM",
+                    "Glm5NextForConditionalGeneration",
                 ]
             except Exception:
                 pass
