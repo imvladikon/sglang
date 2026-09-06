@@ -63,6 +63,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.req_to_metadata_buffer_idx_allocator = Mock()
         self.enable_hicache_storage = True
         self.chunked_req = None
+        # The Flash scheduler sends its health signal after processing results.
+        # No live scheduler/socket is started by this mixin-only fixture.
+        self.maybe_send_health_check_signal = Mock()
 
 
 def _batch(req):
