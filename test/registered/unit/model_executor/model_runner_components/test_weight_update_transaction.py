@@ -7,6 +7,8 @@ import torch
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -43,6 +45,11 @@ class _FinalizeFailingHookModel(_HookModel):
 
 
 class TestWeightUpdateTransaction(unittest.TestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", weight_cache_mode="off"), role="test")
+
     def make_updater(self, model):
         runner = SimpleNamespace(server_args=SimpleNamespace(weight_cache_mode="off"))
         return WeightUpdater(
