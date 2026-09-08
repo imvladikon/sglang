@@ -294,8 +294,12 @@ class TestGlm5NextGate(_FusionGateCase):
                 moe_ep_size=moe_ep_size,
             )
 
-    def test_aiter_gfx95_enables_shared_expert_fusion(self):
-        self.assertIsNone(self._reason_for_backend(use_aiter_gfx95=True))
+    def test_aiter_gfx95_keeps_shared_expert_fusion_disabled(self):
+        # The upstream GLM AMD enablement was reverted; optional AITER kernels
+        # do not by themselves qualify shared-expert weight remapping.
+        self.assertIn(
+            "requires CUDA", self._reason_for_backend(use_aiter_gfx95=True)
+        )
 
     def test_unsupported_non_cuda_backend_disables_shared_expert_fusion(self):
         self.assertIn("requires CUDA", self._reason_for_backend())
@@ -310,13 +314,13 @@ class TestGlm5NextGate(_FusionGateCase):
     def test_expert_parallelism_still_disables_shared_expert_fusion(self):
         self.assertIn(
             "expert parallelism",
-            self._reason_for_backend(use_aiter_gfx95=True, moe_ep_size=2),
+            self._reason_for_backend(is_cuda=True, device_sm=80, moe_ep_size=2),
         )
 
     def test_deepep_still_disables_shared_expert_fusion(self):
         self.assertIn(
             "Deepep",
-            self._reason_for_backend(use_aiter_gfx95=True, deepep=True),
+            self._reason_for_backend(is_cuda=True, device_sm=80, deepep=True),
         )
 
 
