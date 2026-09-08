@@ -387,10 +387,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # to its dense layout, so ragged verify graphs are supported.
     supports_ragged_verify_graph: bool = True
 
-    # Candidate states remain isolated until acceptance, so target metadata may load
-    # on the MTP plan stream.
-    supports_overlap_plan_stream_graph_load: bool = True
-
     # KDA gets graph padding explicitly and never uses ReplaySSM's host-seqlen
     # force-flush path.
     needs_cpu_seq_lens: bool = False
@@ -910,6 +906,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 + tuple(core_attn_out.shape[2:])
             )
             core_attn_out = torch.cat((core_attn_out, pad), dim=1)
+
+        if (
+            self.accept_lens_pool is not None
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # Fused-accept staging: the extend kernel just wrote this request's
+            # committed state; copy it into scratch slot 0 and reset the accept
+            # length to 1 so the first verify reads slot 0. Runs once per KDA
+            # layer (the nat write is idempotent; the scratch copy is per-layer).
+            slots = cache_indices.to(torch.int64)
+            intermediate_ssm = mamba_cache_params.intermediate_ssm
+            intermediate_ssm[slots, 0] = ssm_states[slots].to(intermediate_ssm.dtype)
+            self.accept_lens_pool[slots] = 1
 
         return core_attn_out
 

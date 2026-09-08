@@ -271,7 +271,6 @@ def sparse_attention_fwd_kernel_v1(
     block_I=64,
     num_stages=2,
     threads=256,
-    return_lse=False,
 ):
     assert dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0, (
         f"dim={dim} must be a power of 2 or a multiple of 64"
@@ -297,7 +296,6 @@ def sparse_attention_fwd_kernel_v1(
     q_shape = [batch, seq_len, num_heads, dim + tail_dim]
     kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
     o_shape = [batch, seq_len, num_heads, dim]
-    lse_shape = [batch, seq_len, num_heads]
     indices_shape = [batch, seq_len, kv_group, topk]
     indices_dtype = "int32"
     dtype = "bfloat16"
@@ -325,7 +323,6 @@ def sparse_attention_fwd_kernel_v1(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        LSE: T.Tensor(lse_shape, accum_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
@@ -425,8 +422,6 @@ def sparse_attention_fwd_kernel_v1(
                 acc_o[h_i, d_i] /= sumexp[h_i]
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
-            if return_lse:
-                T.copy(sumexp, LSE[b_i, s_i, H0:H1])
 
             T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
@@ -458,7 +453,6 @@ def sparse_attention_fwd_kernel_v2(
     kv_group: int = 1,
     sm_scale: Optional[float] = None,
     block_I: int = 64,
-    return_lse: bool = False,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
@@ -482,7 +476,6 @@ def sparse_attention_fwd_kernel_v2(
     q_shape = [batch, qo_len, num_heads, dim + tail_dim]
     kv_shape = [batch, num_pages, kv_group, dim + tail_dim]
     o_shape = [batch, qo_len, num_heads, dim]
-    lse_shape = [batch, qo_len, num_heads]
     indices_shape = [batch, qo_len, kv_group, topk]
 
     indices_dtype = "int32"
@@ -511,7 +504,6 @@ def sparse_attention_fwd_kernel_v2(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-        LSE: T.Tensor(lse_shape, accum_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         """
@@ -679,8 +671,6 @@ def sparse_attention_fwd_kernel_v2(
                     acc_o_l[h_i, d_i] /= sumexp[h_i]
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
-                if return_lse:
-                    T.copy(sumexp, LSE[b_i, s_i, H0:H1])
                 T.copy(acc_o_l, O_shared_l)
                 T.copy(O_shared_l, Output[b_i, s_i, H0:H1, 0 : D // 2])
             elif tx >= 128 and tx < 256:
@@ -894,16 +884,13 @@ def sparse_mla_fwd_decode_partial(
         with T.Kernel(seq_len * REPLICATE_H, N_GROUPS, threads=threads) as (bx, by):
             if _q_in_shared:
                 Q_buf = T.alloc_shared([H_per_block, D], dtype)
-                if D_tail > 0:
-                    Q_tail_buf = T.alloc_shared([H_per_block, D_tail], dtype)
+                Q_tail_buf = T.alloc_shared([H_per_block, D_tail], dtype)
             else:
                 Q_buf = T.alloc_fragment([H_per_block, D], dtype)
-                if D_tail > 0:
-                    Q_tail_buf = T.alloc_fragment([H_per_block, D_tail], dtype)
+                Q_tail_buf = T.alloc_fragment([H_per_block, D_tail], dtype)
 
             KV_shared = T.alloc_shared([BI, D], dtype)
-            if D_tail > 0:
-                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
             S_shared = T.alloc_shared([H_per_block, BI], dtype)
             mask = T.alloc_fragment([BI], T.bool)
 
@@ -926,8 +913,7 @@ def sparse_mla_fwd_decode_partial(
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_buf)
-            if D_tail > 0:
-                T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_buf)
+            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_buf)
 
             for k_i in T.Pipelined(inner_iter, num_stages=num_stages):
                 topk_block_i = group_i * inner_iter + k_i
@@ -939,12 +925,11 @@ def sparse_mla_fwd_decode_partial(
                     KV_shared[bi_i, d_i] = KV[
                         b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
                     ]
-                if D_tail > 0:
-                    for bi_i, d_i in T.Parallel(BI, D_tail):
-                        idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
-                        K_tail_shared[bi_i, d_i] = KV[
-                            b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i
-                        ]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
+                    K_tail_shared[bi_i, d_i] = KV[
+                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i
+                    ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -958,14 +943,13 @@ def sparse_mla_fwd_decode_partial(
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullCol,
                 )
-                if D_tail > 0:
-                    T.gemm(
-                        Q_tail_buf,
-                        K_tail_shared,
-                        acc_s,
-                        transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullCol,
-                    )
+                T.gemm(
+                    Q_tail_buf,
+                    K_tail_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
 
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -1176,9 +1160,8 @@ def sparse_mla_fwd_decode_partial_fp8(
             kv_tile1 = T.alloc_shared([BI, group_size], fp8_dtype)
             kv_tile2 = T.alloc_shared([BI, group_size], fp8_dtype)
             kv_tile3 = T.alloc_shared([BI, group_size], fp8_dtype)
-            if d_tail > 0:
-                q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
-                k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
+            q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
+            k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
             s_fp8_shared = T.alloc_shared([h_per_block, BI], fp8_dtype)
             page_idx_shared = T.alloc_shared([BI], T.int32)
 
@@ -1205,8 +1188,7 @@ def sparse_mla_fwd_decode_partial_fp8(
             T.fill(sumexp, 0)
             T.fill(m_i, -(2**30))
 
-            if d_tail > 0:
-                T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
+            T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
             T.copy(q_fp8[b_i, s_i, H0:H1, 0 * group_size : 1 * group_size], q_tile0)
             T.copy(q_fp8[b_i, s_i, H0:H1, 1 * group_size : 2 * group_size], q_tile1)
             T.copy(q_fp8[b_i, s_i, H0:H1, 2 * group_size : 3 * group_size], q_tile2)
@@ -1228,12 +1210,9 @@ def sparse_mla_fwd_decode_partial_fp8(
                     kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
                     kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
 
-                if d_tail > 0:
-                    for bi_i, j in T.Parallel(BI, d_tail):
-                        page = page_idx_shared[bi_i]
-                        k_tail_shared[bi_i, j] = kv_fp8[
-                            b_i, page, g_i, rope_offset_fp8 + j
-                        ]
+                for bi_i, j in T.Parallel(BI, d_tail):
+                    page = page_idx_shared[bi_i]
+                    k_tail_shared[bi_i, j] = kv_fp8[b_i, page, g_i, rope_offset_fp8 + j]
 
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -1250,14 +1229,13 @@ def sparse_mla_fwd_decode_partial_fp8(
                 T.gemm(q_tile3, kv_tile3, acc_tile, transpose_B=True, clear_accum=True)
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
-                if d_tail > 0:
-                    T.gemm(
-                        q_tail_buf,
-                        k_tail_shared,
-                        acc_s,
-                        transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullCol,
-                    )
+                T.gemm(
+                    q_tail_buf,
+                    k_tail_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
 
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -1350,7 +1328,6 @@ def tilelang_sparse_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
-    return_lse: bool = False,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1360,7 +1337,6 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     if _is_hip:
-        assert not return_lse, "tilelang HIP sparse fwd does not return LSE"
         is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
         if is_fp8_kv:
             if q.dtype != kv.dtype:
@@ -1417,17 +1393,8 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, return_lse=return_lse
-        )
-        # Caller-allocated LSE (in-place kernel arg): written only by kernels
-        # traced with return_lse=True, but the prim_func signature always has it.
-        lse = torch.empty(
-            (1, q.shape[0], num_heads), dtype=torch.float32, device=q.device
-        )
-        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0), lse)  # type: ignore
-    if return_lse:
-        return out, lse
+        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
 

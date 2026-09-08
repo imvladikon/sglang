@@ -74,24 +74,44 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
     return get_dsa_mtp_topk_width(hf_config)
 
 
-def should_send_aux_metadata(
-    *,
-    attn_cp_rank: int,
-    prefill_attn_tp_size: int,
-    prefill_attn_tp_rank: int,
-    decode_attn_tp_size: int,
-    decode_attn_tp_rank: int,
-) -> bool:
-    """Choose the sole PP/CP/TP writer for replicated AUX; non-writers must still notify completion."""
-    primary_prefill_tp_rank = (
-        decode_attn_tp_rank * prefill_attn_tp_size // decode_attn_tp_size
+def should_bypass_dsa_cp_prefix_cache(server_args, *, is_dsa: bool) -> bool:
+    """Avoid non-local prefix-cache rows until PD supports CP-aware resharding."""
+    return (
+        is_dsa
+        and server_args.disaggregation_mode == "prefill"
+        and server_args.attn_cp_size > 1
+        and server_args.enable_prefill_cp
     )
-    return attn_cp_rank == 0 and prefill_attn_tp_rank == primary_prefill_tp_rank
 
 
 def is_dsv4_c128_online_enabled() -> bool:
     """Return whether DSV4 C128 uses request-scoped online state."""
     return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
+def get_dsv4_c4_state_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    ring_size: int,
+) -> np.ndarray:
+    """Return physical rows for the live C4 compressor history.
+
+    Prefill and decode may use different C4 ring sizes (8 without speculative
+    decoding and 16 with EAGLE/MTP).  State transfer must therefore pair rows
+    by logical token position instead of copying a whole request-local bank.
+    The C4 overlap compressor keeps ``seq_len % 4 + 4`` live rows.
+    """
+    if ring_size < 8 or ring_size % 4 != 0:
+        raise ValueError(
+            f"C4 ring_size must be a multiple of 4 and at least 8, got {ring_size}"
+        )
+
+    seq_len = max(0, int(seq_len))
+    state_len = seq_len % 4 + 4
+    positions = np.arange(max(0, seq_len - state_len), seq_len, dtype=np.int64)
+    rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
+    return rows.astype(np.int32)
 
 
 def get_dsv4_c128_state_indices(
@@ -168,16 +188,6 @@ def unified_memory_disagg_move_gate(scheduler):
     raise ValueError(
         "unified_memory_disagg_move_gate: scheduler is not a PD node "
         f"(mode={scheduler.disaggregation_mode})"
-    )
-
-
-def should_bypass_dsa_cp_prefix_cache(server_args) -> bool:
-    """Bypass prefix cache under DSA Prefill CP until CP-aware radix resharding
-    exists; without it, cache hits let attention read non-local page rows."""
-    return (
-        server_args.disaggregation_mode == DisaggregationMode.PREFILL.value
-        and server_args.attn_cp_size > 1
-        and server_args.enable_dsa_prefill_context_parallel
     )
 
 
@@ -847,54 +857,6 @@ def compute_mamba_state_slice_blocks(
     return blocks
 
 
-def resolve_linear_state_shards(
-    *,
-    prefill_attn_tp_size: int,
-    prefill_attn_tp_rank: int,
-    prefill_attn_cp_size: int,
-    prefill_attn_cp_rank: int,
-    decode_attn_tp_size: int,
-    decode_tp_rank: int,
-) -> Optional[Tuple[int, int, int, int]]:
-    """Map a prefill TP/CP head shard to decode TP; return None for disjoint ranges."""
-    values = {
-        "prefill_attn_tp_size": prefill_attn_tp_size,
-        "prefill_attn_cp_size": prefill_attn_cp_size,
-        "decode_attn_tp_size": decode_attn_tp_size,
-    }
-    for name, value in values.items():
-        if value <= 0:
-            raise ValueError(f"{name} must be positive, got {value}")
-
-    if prefill_attn_cp_size > 1:
-        src_shard_size = prefill_attn_cp_size
-        src_shard_rank = prefill_attn_cp_rank
-    else:
-        src_shard_size = prefill_attn_tp_size
-        src_shard_rank = prefill_attn_tp_rank
-    dst_shard_size = decode_attn_tp_size
-    dst_shard_rank = decode_tp_rank % decode_attn_tp_size
-
-    if not 0 <= src_shard_rank < src_shard_size:
-        raise ValueError(
-            f"Prefill linear-state shard rank {src_shard_rank} is outside "
-            f"[0, {src_shard_size})"
-        )
-    if max(src_shard_size, dst_shard_size) % min(src_shard_size, dst_shard_size):
-        raise ValueError(
-            "Linear-state shard sizes must divide each other, got "
-            f"prefill={src_shard_size}, decode={dst_shard_size}"
-        )
-
-    if src_shard_size >= dst_shard_size:
-        overlaps = src_shard_rank * dst_shard_size // src_shard_size == dst_shard_rank
-    else:
-        overlaps = dst_shard_rank * src_shard_size // dst_shard_size == src_shard_rank
-    if not overlaps:
-        return None
-    return src_shard_size, src_shard_rank, dst_shard_size, dst_shard_rank
-
-
 def compute_mamba_state_slice_byte_blocks(
     *,
     src_item_len: int,
@@ -1514,7 +1476,10 @@ def setup_state_kv_args(
                 kv_args.kv_buf_groups = (
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
                 )
-                kv_args.total_kv_layers = total_kv_layers
+                kv_args.hidden_kv_layers = total_kv_layers
+                kv_args.draft_kv_layers = (
+                    draft_token_to_kv_pool.layer_num if draft_token_to_kv_pool else 0
+                )
             else:
                 append_state_component(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
@@ -1540,6 +1505,22 @@ def setup_state_kv_args(
                 c128_lens,
                 c128_item_lens,
             )
+
+        # On A5 (CYCLE cache_mode), C4 state uses request-local ring rows rather
+        # than SWA pages.  Register it separately so P and D can independently
+        # map logical positions when their local ring sizes differ.
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        if is_npu_arch35():
+            c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
+            if c4_ptrs:
+                append_state_component(
+                    kv_args,
+                    AscendStateType.DSV4_C4_STATE,
+                    c4_ptrs,
+                    c4_lens,
+                    c4_item_lens,
+                )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component

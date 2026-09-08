@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.runtime_context import get_exec
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -238,7 +240,9 @@ def build_kv_cache(
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
-    bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(server_args)
+    bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(
+        server_args, is_dsa=is_deepseek_dsa(model_config.hf_config)
+    )
     disable_radix_cache = (
         get_memory().disable_radix_cache
         or (model_config.is_multimodal and uses_transformers_backend)
@@ -323,8 +327,8 @@ def build_kv_cache(
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
-        enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-        enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
+        enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
         attn_cp_rank=ps.attn_cp_rank,

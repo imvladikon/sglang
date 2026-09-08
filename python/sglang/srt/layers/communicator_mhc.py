@@ -25,7 +25,6 @@ from sglang.srt.distributed.communication_op import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import (
     AttentionInputs,
     CommunicateContext,
@@ -54,9 +53,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def tp_all_gather_hidden_states(hidden_states, forward_batch):
-    assert (
-        get_attn_tp_context().input_scattered
-    ), "Input scattered guarantees same num tokens in TP group."
+    assert get_attn_tp_context().input_scattered, (
+        "Input scattered guarantees same num tokens in TP group."
+    )
     total_tokens = forward_batch.input_ids.shape[0]
     output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
     get_tp_group().all_gather_into_tensor(output, hidden_states)
@@ -459,8 +458,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         if self.layer_scatter_modes.mlp_mode == ScatterMode.MOE_FULL:
             raise NotImplementedError(
                 "MHCLayerCommunicator does not support MOE_FULL "
-                "(moe_dp_size < attention_context_parallel_size without "
-                "--enable-prefill-cp). Set --enable-prefill-cp or raise "
+                "(moe_dp_size < attention_context_parallel_size). Increase "
                 "moe_dp_size to match attention_context_parallel_size."
             )
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -581,9 +579,6 @@ class MHCLayerCommunicator(LayerCommunicator):
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
-
-        if dsa_use_prefill_cp(forward_batch):
-            return True
 
         if get_attn_tp_context().input_scattered:
             return True

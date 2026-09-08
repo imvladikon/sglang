@@ -62,6 +62,27 @@ class TestKPoolMqaBackend(CustomTestCase):
             backend, result, "flashinfer_sparse_mla", "prefill"
         )
 
+    def test_torch_reference_uses_published_cp_topology(self):
+        metadata = SimpleNamespace(topk_transform_method=TopkTransformMethod.PAGED)
+        indexer = SimpleNamespace(
+            wq_b=MagicMock(side_effect=RuntimeError("query reached"))
+        )
+        for cp_size, error, message in (
+            (1, RuntimeError, "query reached"),
+            (2, NotImplementedError, "does not support CP"),
+        ):
+            with (
+                patch.object(
+                    dsa_indexer_kpool,
+                    "get_parallel",
+                    return_value=SimpleNamespace(attn_cp_size=cp_size),
+                ),
+                self.assertRaisesRegex(error, message),
+            ):
+                dsa_indexer_kpool.IndexerKPool._forward_cuda_torch_reference(
+                    indexer, None, None, None, True, metadata
+                )
+
     def test_torch_reference_skips_deep_gemm_schedule_at_long_context(self):
         backend = self._fallback_backend()
         self.assertTrue(
@@ -114,9 +135,7 @@ class TestKPoolMqaBackend(CustomTestCase):
             )
 
     def test_torch_sparse_mla_matches_direct_attention(self):
-        q = torch.tensor(
-            [[[1.0, 0.0, 0.5], [0.0, 1.0, -0.5]]], dtype=torch.bfloat16
-        )
+        q = torch.tensor([[[1.0, 0.0, 0.5], [0.0, 1.0, -0.5]]], dtype=torch.bfloat16)
         kv = torch.tensor(
             [[1.0, 0.0, 0.5], [0.0, 1.0, -0.5], [1.0, 1.0, 0.0]],
             dtype=torch.bfloat16,

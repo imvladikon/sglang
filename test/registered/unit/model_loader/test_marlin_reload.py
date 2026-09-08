@@ -21,6 +21,8 @@ from sglang.srt.model_loader.marlin_reload import (
     record_marlin_reload_metadata,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -256,6 +258,12 @@ def _cold_kernel(checkpoint):
 
 
 class TestMarlinReload(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", weight_cache_mode="off"), role="test")
+
     def test_model_post_load_observes_model_format_before_marlin_repack(self):
         model = _SyntheticGlmPostLoadBlock()
         initial = _checkpoint(0)

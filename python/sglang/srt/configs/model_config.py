@@ -151,6 +151,14 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def is_glm_moe_dsa(config) -> bool:
+    """True for GLM-5.2, both the main arch and the NextN draft head."""
+    return _hf_arch(config) in (
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
+    )
+
+
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
@@ -694,7 +702,6 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
-
         cfg = resolving_view(server_args)
         quantization = (
             cfg.speculative_draft_model_quantization
@@ -1206,9 +1213,19 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
-        self.spec_hidden_size, self.hc_hidden_size = resolve_spec_hidden_size(
-            self.hf_config, self.hidden_size, hc_mult
+        is_glm5_next = getattr(self.hf_config, "model_type", None) == "glm5_next" or (
+            getattr(self.hf_text_config, "model_type", None) == "glm5_next_text"
         )
+        if is_glm5_next and not getattr(self.hf_text_config, "mhc", False):
+            hc_mult = 1
+        if is_glm5_next:
+            # mHC-flattened hidden size; None when not running an mHC model.
+            self.hc_hidden_size = self.hidden_size * hc_mult if hc_mult > 1 else None
+            self.spec_hidden_size = self.hidden_size
+        else:
+            self.spec_hidden_size, self.hc_hidden_size = resolve_spec_hidden_size(
+                self.hf_config, self.hidden_size, hc_mult
+            )
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
@@ -2241,7 +2258,6 @@ def is_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
 ):
-
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
         "DeepseekV4ForCausalLM",

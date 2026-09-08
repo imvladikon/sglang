@@ -133,3 +133,21 @@ def test_lora_disables_the_unquantized_fused_kda_layout():
         assert _can_fuse_kda_projections(None, 2, 2)
         assert not _can_fuse_kda_projections(None, 1, 2)
         assert not _can_fuse_kda_projections(object(), 2, 2)
+
+
+def test_indexer_lora_checks_fusion_on_the_instantiated_modules():
+    import pytest
+    from torch import nn
+    from sglang.srt.lora.lora_manager import LoRAManager
+
+    manager = LoRAManager.__new__(LoRAManager)
+    manager.base_model = nn.Sequential(nn.Linear(4, 4))
+    manager.configs = {}
+    manager.lora_added_tokens_size = 0
+    manager.base_model[0].use_dsa_indexer_fusion = True
+    with pytest.raises(ValueError, match="incompatible with DSA indexer Q/K fusion"):
+        manager.init_lora_shapes(max_lora_rank=4, target_modules={"indexer.wk"})
+    manager.base_model[0].use_dsa_indexer_fusion = False
+    manager.init_lora_shapes(max_lora_rank=4, target_modules={"indexer.wk"})
+    assert manager.target_modules == {"indexer.wk"}
+    assert manager.max_lora_rank == 4

@@ -51,7 +51,6 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
-    should_send_aux_metadata,
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
@@ -1525,13 +1524,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_ptrs,
                 dst_ptrs,
                 self.kv_args.prefill_start_layer,
-                getattr(self.kv_args, "prefill_end_layer", None),
+                self.kv_args.prefill_end_layer,
             )
             dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
                 src_ptrs,
                 dst_item_lens,
                 self.kv_args.prefill_start_layer,
-                getattr(self.kv_args, "prefill_end_layer", None),
+                self.kv_args.prefill_end_layer,
             )
             transfer_blocks = build_dsa_tail_transfer_blocks(
                 src_ptrs,
@@ -1977,20 +1976,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     )
                                     break
 
-                            if should_send_aux_metadata(
-                                attn_cp_rank=self.attn_cp_rank,
-                                prefill_attn_tp_size=self.attn_tp_size,
-                                prefill_attn_tp_rank=self.attn_tp_rank,
-                                decode_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
-                                decode_attn_tp_rank=target_rank_registration_info.dst_tp_rank,
-                            ):
-                                ret = self.send_aux(
-                                    req,
-                                    kv_chunk.prefill_aux_index,
-                                    target_rank_registration_info.dst_aux_ptrs,
-                                )
-                            else:
-                                ret = 0
+                            # Only the last chunk we need to send the aux data
+                            ret = self.send_aux(
+                                req,
+                                kv_chunk.prefill_aux_index,
+                                target_rank_registration_info.dst_aux_ptrs,
+                            )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)

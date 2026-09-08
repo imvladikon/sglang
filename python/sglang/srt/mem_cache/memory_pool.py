@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -80,6 +80,7 @@ from sglang.srt.utils import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    is_xpu,
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import (
@@ -258,6 +259,9 @@ class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     enable_mamba_extra_buffer_lazy: bool = False
+    # Class default: some decode pools borrow another __init__ (see
+    # DecodeReqToTokenPool) but inherit alloc_rows.
+    _on_alloc_rows: Optional[Callable[[List[int]], None]] = None
 
     def __init__(
         self,
@@ -321,6 +325,8 @@ class ReqToTokenPool:
         select_index = self.free_slots[-need_size:]
         del self.free_slots[-need_size:]
         self.req_generation[select_index] += 1
+        if self._on_alloc_rows is not None:
+            self._on_alloc_rows(select_index)
         return select_index
 
     def free_rows(self, indices: List[int]) -> None:
@@ -345,6 +351,10 @@ class ReqToTokenPool:
     def attach_aux_cache(self, aux_cache: Any) -> None:
         assert self._aux_cache is None
         self._aux_cache = aux_cache
+
+    def register_on_alloc_rows(self, hook: Callable[[List[int]], None]) -> None:
+        assert self._on_alloc_rows is None
+        self._on_alloc_rows = hook
 
     def reset_aux_cache_allocator(self) -> None:
         if self._aux_cache is not None:
@@ -1384,6 +1394,28 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
+    @property
+    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
+        """The mamba virtual->physical slot table, or None when the ids this
+        pool hands out are already physical."""
+        return None
+
+    @property
+    def mamba_translate_is_fusable(self) -> bool:
+        """Whether `fused_replay_state_indices` can reproduce this pool's
+        `translate_mamba_indices` in its own launch.
+
+        The kernel expresses exactly two shapes: the identity, and one gather
+        through `mamba_v2p_table`. A subclass that replaces the translate with
+        anything else is excluded here rather than silently mis-served.
+        """
+        if self.mamba_v2p_table is not None:
+            return True
+        return (
+            type(self).translate_mamba_indices
+            is HybridReqToTokenPool.translate_mamba_indices
+        )
+
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba-slot translate. Identity for a static pool
         (slots are physical); UnifiedHybridReqToTokenPool overrides it for the
@@ -1568,7 +1600,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             req.kv.mamba_next_track_idx = None
             req.kv.mamba_last_track_idx = None
             req.kv.mamba_last_track_seqlen = None
-            req.mamba_branching_seqlen = None
             req.kv.mamba_cow_src_index = None
             req.kv.mamba_needs_clear = False
 
@@ -3532,7 +3563,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             )
         return self.k_scale_buffer[idx][loc], self.v_scale_buffer[idx][loc]
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         # The scales travel with their fp8 payload; a restored slot dequantizes
         # against mismatched exponents without them.
         assert not self.use_hnd, (
@@ -3562,7 +3593,9 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         current_platform.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         assert not self.use_hnd, (
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
@@ -3657,8 +3690,6 @@ class HybridLinearKVPool(KVCache):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         start_layer: Optional[int] = None,
-        layer_shard_rank: Optional[int] = None,
-        layer_shard_size: int = 1,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
         # When provided (shared-KV-pool path), use this pool for the
@@ -3731,20 +3762,10 @@ class HybridLinearKVPool(KVCache):
             # DSA sparse full-attention layers share the MLA latent layout and
             # additionally keep a paged index_k cache. Only full-attn layer count
             # is allocated here; the wrapper translates global layer_id to dense.
-            assert (
-                index_head_dim is not None and kv_cache_dim is not None
-            ), "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
-            pool_kwargs = {}
-            DSAPoolCls = DSATokenToKVPool
-            if layer_shard_rank is not None and layer_shard_size > 1:
-                from sglang.srt.mem_cache.dsa_cache_layer_split import (
-                    LayerSplitDSATokenToKVPool,
-                )
-
-                DSAPoolCls = LayerSplitDSATokenToKVPool
-                pool_kwargs["layer_shard_rank"] = layer_shard_rank
-                pool_kwargs["layer_shard_size"] = layer_shard_size
-            self.full_kv_pool = DSAPoolCls(
+            assert index_head_dim is not None and kv_cache_dim is not None, (
+                "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
+            )
+            self.full_kv_pool = DSATokenToKVPool(
                 size=size,
                 page_size=self.page_size,
                 kv_lora_rank=kv_lora_rank,
@@ -3760,7 +3781,6 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
-                **pool_kwargs,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -3837,28 +3857,6 @@ class HybridLinearKVPool(KVCache):
     @property
     def slots_per_page(self) -> int:
         return getattr(self.full_kv_pool, "slots_per_page", self.page_size)
-
-    @property
-    def layer_shard_enabled(self) -> bool:
-        return bool(getattr(self.full_kv_pool, "layer_shard_enabled", False))
-
-    @property
-    def layer_shard_rank(self) -> Optional[int]:
-        return getattr(self.full_kv_pool, "layer_shard_rank", None)
-
-    @property
-    def layer_shard_size(self) -> int:
-        return getattr(self.full_kv_pool, "layer_shard_size", 1)
-
-    @property
-    def layer_shard_start(self) -> int:
-        return getattr(self.full_kv_pool, "layer_shard_start", self.start_layer)
-
-    def _is_layer_owned(self, layer_id: int) -> bool:
-        if not self.layer_shard_enabled:
-            return True
-        full_layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool._is_layer_owned(full_layer_id)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
@@ -4062,14 +4060,6 @@ class HybridLinearKVPool(KVCache):
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
-    def prefetch_full_attention_kv_buffer(self, layer_id: int) -> None:
-        if not self.use_mla or not hasattr(self.full_kv_pool, "prefetch_kv_buffer"):
-            return
-        if layer_id not in self.full_attention_layer_id_mapping:
-            return
-        full_layer_id = self._transfer_full_attention_id(layer_id)
-        self.full_kv_pool.prefetch_kv_buffer(full_layer_id)
-
     def get_mla_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4098,9 +4088,9 @@ class HybridLinearKVPool(KVCache):
         )
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        assert (
-            self.use_dsa
-        ), "get_index_k_with_scale_buffer called when use_dsa is False"
+        assert self.use_dsa, (
+            "get_index_k_with_scale_buffer called when use_dsa is False"
+        )
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id)
@@ -4108,9 +4098,9 @@ class HybridLinearKVPool(KVCache):
     def get_broadcastable_index_k_with_scale_buffer(
         self, layer_id: int
     ) -> torch.Tensor:
-        assert (
-            self.use_dsa
-        ), "get_broadcastable_index_k_with_scale_buffer called when use_dsa is False"
+        assert self.use_dsa, (
+            "get_broadcastable_index_k_with_scale_buffer called when use_dsa is False"
+        )
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         if hasattr(self.full_kv_pool, "_get_broadcastable_index_buffer"):
@@ -4184,9 +4174,9 @@ class HybridLinearKVPool(KVCache):
         out_cache_loc: torch.Tensor,
         round_scale: bool = False,
     ) -> None:
-        assert (
-            self.use_dsa
-        ), "kpool_decode_update_index_cache called when use_dsa is False"
+        assert self.use_dsa, (
+            "kpool_decode_update_index_cache called when use_dsa is False"
+        )
         layer_id = self._transfer_full_attention_id(layer_id)
         self.full_kv_pool.kpool_decode_update_index_cache(
             layer_id=layer_id,
@@ -4210,9 +4200,9 @@ class HybridLinearKVPool(KVCache):
         n_remain: int,
         dst_logical_start: int,
     ) -> None:
-        assert (
-            self.use_dsa
-        ), "set_compress_tail_for_request called when use_dsa is False"
+        assert self.use_dsa, (
+            "set_compress_tail_for_request called when use_dsa is False"
+        )
         layer_id = self._transfer_full_attention_id(layer_id)
         self.full_kv_pool.set_compress_tail_for_request(
             layer_id=layer_id,
@@ -4772,6 +4762,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 assert self.page_size == 1, (
                     f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
                 )
+        elif is_xpu():
+            assert self.page_size in (
+                64,
+                128,
+            ), f"XPU DSA requires page_size 64 or 128, got {self.page_size}"
         else:
             assert self.page_size == 64
         self.index_key_cache = self._create_index_key_cache()
@@ -4815,9 +4810,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self._compress_tail_score = None
             return
 
-        assert (
-            max_running_requests is not None
-        ), "DSATokenToKVPool with kpool compress requires max_running_requests"
+        assert max_running_requests is not None, (
+            "DSATokenToKVPool with kpool compress requires max_running_requests"
+        )
         # +1 mirrors req_to_token_pool.size + 1 used by the indexer to
         # provide an extra slot for invalid / sentinel req indices.
         req_pool_size = max_running_requests + 1
@@ -4852,9 +4847,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_compress_tail_buffers(
         self, layer_id: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            self.kpool_use_compress
-        ), "get_compress_tail_buffers called when kpool compress is disabled"
+        assert self.kpool_use_compress, (
+            "get_compress_tail_buffers called when kpool compress is disabled"
+        )
         idx = layer_id - self.start_layer
         return (
             self._compress_tail_k[idx],
@@ -4864,14 +4859,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_compress_tail_buf_infos(self):
         if not self.kpool_use_compress:
             return [], [], []
-        if self.layer_shard_enabled:
-            transfer_layer_ids = [
-                i
-                for i in range(self.layer_num)
-                if self._is_layer_owned(self.start_layer + i)
-            ]
-        else:
-            transfer_layer_ids = list(range(self.layer_num))
+        transfer_layer_ids = list(range(self.layer_num))
         # Keep zero-row indexShare entries in the pointer list so layer offsets
         # stay aligned across PD peers; item_len=0 makes transfer backends skip them.
         tail_buffers = [self._compress_tail_k[i] for i in transfer_layer_ids] + [
@@ -4899,9 +4887,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             kpool_decode_update_and_maybe_write_cache,
         )
 
-        assert (
-            self.kpool_use_compress
-        ), "kpool_decode_update_index_cache called when kpool compress is disabled"
+        assert self.kpool_use_compress, (
+            "kpool_decode_update_index_cache called when kpool compress is disabled"
+        )
         idx = layer_id - self.start_layer
         buf = self.get_index_k_with_scale_buffer(layer_id)
         kpool_decode_update_and_maybe_write_cache(
@@ -4930,9 +4918,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         dst_logical_start: int,
     ) -> None:
         """Leave the ring untouched at a pool boundary; no tail carries over."""
-        assert (
-            self.kpool_use_compress
-        ), "set_compress_tail_for_request called when kpool compress is disabled"
+        assert self.kpool_use_compress, (
+            "set_compress_tail_for_request called when kpool compress is disabled"
+        )
         idx = layer_id - self.start_layer
         if n_remain > 0:
             slots = (
