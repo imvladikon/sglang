@@ -45,7 +45,16 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         )
         self.assertEqual(
             self.actions_by_option["--schedule-policy"].choices,
-            ["lpm", "random", "fcfs", "dfs-weight", "lof", "priority", "routing-key"],
+            [
+                "lpm",
+                "random",
+                "fcfs",
+                "dfs-weight",
+                "lof",
+                "priority",
+                "routing-key",
+                "hrrn",
+            ],
         )
         self.assertEqual(
             self.actions_by_option["--load-balance-method"].choices,
@@ -69,18 +78,24 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         for backend in ("torch", "triton"):
             for prefix in ("dsa", "nsa"):
                 with self.subTest(backend=backend, prefix=prefix):
-                    args = self.parser.parse_args(
-                        [
-                            "--model",
-                            "dummy",
-                            f"--{prefix}-prefill-backend",
-                            backend,
-                            f"--{prefix}-decode-backend",
-                            backend,
-                            "--dsa-paged-mqa-logits-backend",
-                            backend,
-                        ]
-                    )
+                    argv = [
+                        "--model",
+                        "dummy",
+                        f"--{prefix}-prefill-backend",
+                        backend,
+                        f"--{prefix}-decode-backend",
+                        backend,
+                        "--dsa-paged-mqa-logits-backend",
+                        backend,
+                    ]
+                    if prefix == "nsa":
+                        # Upstream retired these aliases; retain fallback support
+                        # through the canonical DSA options only.
+                        with self.assertRaises(SystemExit) as retired:
+                            self.parser.parse_args(argv)
+                        self.assertEqual(retired.exception.code, 2)
+                        continue
+                    args = self.parser.parse_args(argv)
                     server_args = ServerArgs.from_cli_args(args)
                     self.assertEqual(server_args.dsa_prefill_backend, backend)
                     self.assertEqual(server_args.dsa_decode_backend, backend)
