@@ -45,7 +45,16 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         )
         self.assertEqual(
             self.actions_by_option["--schedule-policy"].choices,
-            ["lpm", "random", "fcfs", "dfs-weight", "lof", "priority", "routing-key"],
+            [
+                "lpm",
+                "random",
+                "fcfs",
+                "dfs-weight",
+                "lof",
+                "priority",
+                "routing-key",
+                "hrrn",
+            ],
         )
         self.assertEqual(
             self.actions_by_option["--load-balance-method"].choices,
@@ -68,18 +77,24 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
     def test_torch_dsa_fallback_survives_cli_field_migration(self):
         for prefix in ("dsa", "nsa"):
             with self.subTest(prefix=prefix):
-                args = self.parser.parse_args(
-                    [
-                        "--model",
-                        "dummy",
-                        f"--{prefix}-prefill-backend",
-                        "torch",
-                        f"--{prefix}-decode-backend",
-                        "torch",
-                        "--dsa-topk-backend",
-                        "torch",
-                    ]
-                )
+                argv = [
+                    "--model",
+                    "dummy",
+                    f"--{prefix}-prefill-backend",
+                    "torch",
+                    f"--{prefix}-decode-backend",
+                    "torch",
+                    "--dsa-topk-backend",
+                    "torch",
+                ]
+                if prefix == "nsa":
+                    # Upstream retired these aliases. The portable fallback
+                    # remains available through the canonical DSA options.
+                    with self.assertRaises(SystemExit) as retired:
+                        self.parser.parse_args(argv)
+                    self.assertEqual(retired.exception.code, 2)
+                    continue
+                args = self.parser.parse_args(argv)
                 server_args = ServerArgs.from_cli_args(args)
                 self.assertEqual(server_args.dsa_prefill_backend, "torch")
                 self.assertEqual(server_args.dsa_decode_backend, "torch")
