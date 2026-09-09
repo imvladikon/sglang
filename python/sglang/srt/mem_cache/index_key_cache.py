@@ -34,7 +34,10 @@ class IndexKeyCache:
         return (
             num_pages,
             pool.page_size
-            * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
+            * (
+                pool.index_head_dim
+                + pool.index_head_dim // pool.indexer_quant_block_size * 4
+            ),
         )
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:

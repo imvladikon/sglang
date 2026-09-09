@@ -12,8 +12,27 @@ from typing import Any
 
 import torch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.attention.dsa.indexer_layout import indexer_quant_block_size
 
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+
+
+def act_quant_torch_dsa(
+    x: torch.Tensor, block_size: int = 128, scale_fmt: str | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize one index-key/query vector per scale without native FP8 ISA.
+
+    This implements the indexer's ``act_quant`` scaling contract in Torch;
+    Triton's E4M3FN conversion cannot compile on SM80.
+    """
+    indexer_quant_block_size(block_size)
+    assert x.is_contiguous() and x.shape[-1] == block_size
+    values = x.float()
+    scales = values.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4) * (1.0 / 448.0)
+    if scale_fmt is not None:
+        scales = torch.exp2(torch.ceil(torch.log2(scales)))
+    quantized = (values / scales).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return quantized, scales
 
 
 def fp8_ragged_mqa_logits_torch_dsa(
@@ -35,7 +54,8 @@ def fp8_ragged_mqa_logits_torch_dsa(
     k_fp8, k_scale = kv_fp8
     num_queries, num_heads, head_dim = q_fp8.shape
     num_keys, key_dim = k_fp8.shape
-    assert head_dim == key_dim == 128
+    indexer_quant_block_size(head_dim)
+    assert head_dim == key_dim
     assert weight.shape == (num_queries, num_heads)
     assert k_scale.shape == (num_keys,)
     assert row_start.shape == row_end.shape == (num_queries,)
@@ -79,7 +99,7 @@ def fp8_paged_mqa_logits_torch_dsa(
     batch_size, next_tokens, num_heads, head_dim = q_fp8.shape
     page_size = kvcache_fp8.shape[1]
     assert next_tokens == 1
-    assert head_dim == 128
+    indexer_quant_block_size(head_dim)
     assert page_size == 64
     assert kvcache_fp8.shape[1:] == (page_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)

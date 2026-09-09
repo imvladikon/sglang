@@ -26,10 +26,15 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.indexer_layout import (
+    check_indexer_backend,
+    indexer_quant_block_size,
+)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
 from sglang.srt.layers.attention.dsa.torch_dsa_fallback import (
+    act_quant_torch_dsa,
     fp8_paged_mqa_logits_torch_dsa,
     fp8_ragged_mqa_logits_torch_dsa,
 )
@@ -247,12 +252,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.hidden_size = hidden_size
         self.n_heads = index_n_heads
         self.head_dim = index_head_dim
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            get_exec().kernel.dsa_paged_mqa_logits_backend
+        )
+        check_indexer_backend(
+            self.head_dim,
+            "torch" if self.paged_mqa_logits_backend.is_torch() else "optimized",
+        )
         self.rope_head_dim = rope_head_dim
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.use_dsa_indexer_fusion = (
             _is_cuda
+            and self.head_dim == 128
+            and not self.paged_mqa_logits_backend.is_torch()
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
             and not is_neox_style
         )
@@ -319,7 +333,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             is_neox_style=is_neox_style,
             device=get_device().device,
         )
-        self.block_size = block_size
+        self.block_size = (
+            indexer_quant_block_size(self.head_dim)
+            if self.paged_mqa_logits_backend.is_torch()
+            else block_size
+        )
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
         self.num_init_tokens = self.num_local_tokens = 0
@@ -327,9 +345,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
 
-        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
-            get_exec().kernel.dsa_paged_mqa_logits_backend
-        )
         if self.paged_mqa_logits_backend.is_triton():
             if not _is_cuda:
                 raise ValueError("dsa_paged_mqa_logits_backend='triton' requires CUDA.")
@@ -611,6 +626,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return
         if (
             not _is_fp8_fnuz
+            and pool.index_head_dim == 128
+            and not self.paged_mqa_logits_backend.is_torch()
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
@@ -900,7 +917,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(kv_cache_fp8.shape) == 2
         block_kv = page_size
         num_heads_kv = 1
-        head_dim_with_sf = 132
+        head_dim_with_sf = self.head_dim + 4
         kv_cache_fp8 = kv_cache_fp8.view(
             kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
         )
@@ -1509,6 +1526,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
+            and pool.index_head_dim == 128
+            and not self.paged_mqa_logits_backend.is_torch()
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
@@ -1530,7 +1549,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # layout (page_size>=16). Otherwise we fall back to the legacy row-major
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
-        if _use_aiter:
+        if _use_aiter and self.head_dim == 128:
             page_size = pool.page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
@@ -1588,7 +1607,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        if _is_hip:
+        if self.paged_mqa_logits_backend.is_torch():
+            act_quant = act_quant_torch_dsa
+        elif _is_hip:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not _is_npu:
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant

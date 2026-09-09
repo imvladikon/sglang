@@ -51,6 +51,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.indexer_layout import (
+    check_indexer_backend,
+    indexer_quant_block_size,
+)
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
@@ -72,7 +76,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -3943,6 +3947,10 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "quant_block_size", None)
 
     @property
+    def indexer_quant_block_size(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "indexer_quant_block_size", None)
+
+    @property
     def index_kpool(self) -> int:
         return getattr(self.full_kv_pool, "index_kpool", 1)
 
@@ -4807,6 +4815,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
     ):
+        # Tiny GLM checkpoints use a narrower indexer. Keep the MLA quantization
+        # block size unchanged; index-K still has exactly one scale per vector.
+        self.indexer_quant_block_size = indexer_quant_block_size(index_head_dim)
+        if index_head_dim != 128:
+            check_indexer_backend(
+                index_head_dim, get_exec().kernel.dsa_paged_mqa_logits_backend
+            )
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
@@ -4835,8 +4850,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_buf_size is None:
             index_buf_size = size
         self.index_buf_size = index_buf_size
-        # num head == 1 and head dim == 128 for index_k in DSA
-        assert index_head_dim == 128
+        # One index-K head; optimized kernels require 128, while the opt-in
+        # torch logits path also handles the 64-wide tiny GLM index head.
 
         self.skip_topk_layers = (
             list(skip_topk_layers)

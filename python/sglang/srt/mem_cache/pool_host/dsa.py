@@ -76,7 +76,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
 
         self.index_head_dim = device_pool.index_head_dim
-        self.indexer_quant_block_size = device_pool.quant_block_size
+        self.indexer_quant_block_size = device_pool.indexer_quant_block_size
         self.indexer_dtype = DSATokenToKVPool.index_k_with_scale_buffer_dtype
         self.indexer_size_per_token = (
             self.index_head_dim

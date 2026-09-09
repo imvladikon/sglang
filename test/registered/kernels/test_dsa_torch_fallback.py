@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.kernels.ops.attention.dsa.index_buf_accessor import GetK, GetS
 from sglang.kernels.ops.attention.dsa.triton_mqa_logits_sm80 import (
     fp8_mqa_logits_triton,
     fp8_paged_mqa_logits_triton,
@@ -15,10 +17,12 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
 )
 from sglang.srt.layers.attention.dsa.torch_dsa_fallback import (
     FP8_DTYPE,
+    act_quant_torch_dsa,
     fp8_paged_mqa_logits_torch_dsa,
     fp8_ragged_mqa_logits_torch_dsa,
     sparse_mla_torch_dsa,
 )
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -35,8 +39,8 @@ def _ragged_reference(q, k, scale, weight, starts, ends):
     return result.cuda().float()
 
 
-def _make_paged_cache(num_pages: int):
-    page_size, head_dim = 64, 128
+def _make_paged_cache(num_pages: int, head_dim: int = 128):
+    page_size = 64
     raw = torch.zeros(
         (num_pages, page_size * (head_dim + 4)), dtype=torch.uint8, device="cuda"
     )
@@ -51,10 +55,11 @@ def _make_paged_cache(num_pages: int):
     return raw.view(num_pages, page_size, 1, head_dim + 4), values, scales
 
 
-def test_ragged_indexer_matches_independent_loop():
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_ragged_indexer_matches_independent_loop(head_dim):
     torch.manual_seed(19)
-    q = torch.randn(4, 8, 128, device="cuda").clamp(-2, 2).to(FP8_DTYPE)
-    k = torch.randn(11, 128, device="cuda").clamp(-2, 2).to(FP8_DTYPE)
+    q = torch.randn(4, 8, head_dim, device="cuda").clamp(-2, 2).to(FP8_DTYPE)
+    k = torch.randn(11, head_dim, device="cuda").clamp(-2, 2).to(FP8_DTYPE)
     scale = torch.rand(11, device="cuda") * 0.2 + 0.05
     weight = torch.rand(4, 8, device="cuda") - 0.3
     starts = torch.tensor([0, 2, 4, 1], device="cuda")
@@ -72,10 +77,11 @@ def test_ragged_indexer_matches_independent_loop():
     )
 
 
-def test_paged_indexer_obeys_packed_layout_and_masks():
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_paged_indexer_obeys_packed_layout_and_masks(head_dim):
     torch.manual_seed(23)
-    cache, values, scales = _make_paged_cache(6)
-    q = torch.randn(2, 1, 8, 128, device="cuda").clamp(-2, 2).to(FP8_DTYPE)
+    cache, values, scales = _make_paged_cache(6, head_dim)
+    q = torch.randn(2, 1, 8, head_dim, device="cuda").clamp(-2, 2).to(FP8_DTYPE)
     weight = torch.rand(2, 8, device="cuda") - 0.2
     lengths = torch.tensor([70, 121], dtype=torch.int32, device="cuda")
     pages = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32, device="cuda")
@@ -100,6 +106,93 @@ def test_paged_indexer_obeys_packed_layout_and_masks():
             actual[batch, :length], expected[:length], atol=5e-4, rtol=1e-5
         )
         assert torch.isneginf(actual[batch, length:]).all()
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_quantized_index_cache_roundtrip_with_partial_reordered_pages(head_dim):
+    torch.manual_seed(59)
+    # MLA quantization remains 128-wide even when index keys are 64-wide.
+    pool = SimpleNamespace(
+        page_size=64,
+        index_head_dim=head_dim,
+        quant_block_size=128,
+        indexer_quant_block_size=head_dim,
+        custom_mem_pool=None,
+        index_k_with_scale_buffer_dtype=torch.uint8,
+        device="cuda",
+        layer_num=2,
+        start_layer=0,
+        skip_topk_layers=[False, True],
+        layer_transfer_counter=None,
+    )
+    cache = IndexKeyCache(pool, index_buf_size=256)
+    buf = cache.get_buffer(0)
+    assert buf.shape == (5, 64 * (head_dim + 4))
+    assert cache.get_buffer(1).shape == (0, 64 * (head_dim + 4))
+    keys = torch.randn(5, head_dim, dtype=torch.bfloat16, device="cuda")
+    quantized, scales = act_quant_torch_dsa(keys, block_size=head_dim)
+    assert scales.shape == (5, 1) and scales.dtype == torch.float32
+    torch.testing.assert_close(
+        quantized.float() * scales, keys.float(), atol=0.125, rtol=0.07
+    )
+    loc = torch.tensor([193, 0, 127, 64, 255], dtype=torch.int64, device="cuda")
+    cache.store_quantized(0, loc, quantized, scales)
+    # Independent byte-layout oracle also catches accidental writes to padding.
+    expected = torch.zeros_like(buf)
+    for row, slot in enumerate(loc.tolist()):
+        page, offset = divmod(slot, 64)
+        expected[page, offset * head_dim : (offset + 1) * head_dim] = quantized[
+            row
+        ].view(torch.uint8)
+        expected[
+            page, 64 * head_dim + offset * 4 : 64 * head_dim + (offset + 1) * 4
+        ] = scales[row].view(torch.uint8)
+    assert torch.equal(buf, expected)
+    pages = torch.tensor([[3, 0], [1, 3]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([67, 65], dtype=torch.int32, device="cuda")
+    expected_k, expected_s = [], []
+    for page_ids, length in zip(pages.tolist(), lengths.tolist()):
+        expected_k.append(
+            torch.cat(
+                [expected[p, : 64 * head_dim].view(64, head_dim) for p in page_ids]
+            )[:length]
+        )
+        expected_s.append(
+            torch.cat([expected[p, 64 * head_dim :].view(64, 4) for p in page_ids])[
+                :length
+            ]
+        )
+    got_k, got_s = cache.get_k_and_scale(0, lengths, pages, 132, 67)
+    assert torch.equal(got_k, torch.cat(expected_k))
+    assert torch.equal(got_s, torch.cat(expected_s))
+    for gather, oracle in [(GetK, expected_k[0]), (GetS, expected_s[0])]:
+        assert torch.equal(gather.triton(pool, buf, 67, pages[0]), oracle)
+        assert torch.equal(gather.torch_fast(pool, buf, 67, pages[0]), oracle)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("scale_fmt", [None, "ue8m0"])
+def test_indexer_quantization_scales_and_reconstruction(head_dim, scale_fmt):
+    torch.manual_seed(61)
+    values = torch.randn(3, 2, head_dim, dtype=torch.bfloat16, device="cuda")
+    values[0, 0] = 0
+    values[0, 1] = 1e-6
+    quantized, scales = act_quant_torch_dsa(values, head_dim, scale_fmt)
+    expected_scales = []
+    for row in values.cpu().reshape(-1, head_dim).double():
+        scale = max(max(abs(float(x)) for x in row), 1e-4) / 448
+        if scale_fmt is not None:
+            scale = 2 ** math.ceil(math.log2(scale))
+        expected_scales.append(scale)
+    expected_scales = torch.tensor(expected_scales, device="cuda").view(3, 2, 1)
+    torch.testing.assert_close(scales, expected_scales, atol=0, rtol=1e-6)
+    assert quantized.dtype == torch.float8_e4m3fn
+    assert scales.dtype == torch.float32
+    assert torch.isfinite(quantized.float()).all()
+    assert torch.equal(quantized[0, 0].float(), torch.zeros_like(values[0, 0]).float())
+    torch.testing.assert_close(
+        quantized.float() * scales, values.float(), atol=1e-8, rtol=0.063
+    )
 
 
 def test_triton_ragged_indexer_matches_torch_oracle_at_glm_shape():
