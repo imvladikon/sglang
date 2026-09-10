@@ -3221,8 +3221,20 @@ class DeepseekSparseAttnBackend(
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
 
+        # FA3 rejects Q/K=256 with V=128. Zero-padding V preserves attention
+        # scores and its first 128 output channels. Keep other devices/layouts
+        # on their existing path, including gfx950 (which also reports SM9).
+        pad_value = (
+            is_cuda()
+            and self.device_sm_major == 9
+            and layer.head_dim == 256
+            and layer.v_head_dim == 128
+        )
+        if pad_value:
+            v = torch.nn.functional.pad(v, (0, layer.head_dim - layer.v_head_dim))
+
         # Use FA3 for SM90 (Hopper/H200)
-        return flash_attn_varlen_func(
+        output = flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -3233,6 +3245,9 @@ class DeepseekSparseAttnBackend(
             softmax_scale=layer.scaling,
             causal=causal,
         )
+        if pad_value:
+            return output[..., : layer.v_head_dim].contiguous()
+        return output
 
     def _forward_tilelang(
         self,
