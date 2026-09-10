@@ -58,6 +58,9 @@ dependencies = [
   "nvidia-cutlass-dsl[cu13]==4.6.2",
   "nvidia-mathdx==25.6.0",
   "nvidia-ml-py",
+  "nvshmem4py-cu13",
+  # Upstream pins openai exactly; we need the range so the rollout client can
+  # share an environment with the training stack.
   "openai>=2.6.1,<4",
   "openai-harmony==0.0.4",
   "orjson",
