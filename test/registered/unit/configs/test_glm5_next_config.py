@@ -7,12 +7,81 @@ from transformers import AutoConfig
 from sglang.srt.configs.glm5_next import Glm5NextTextConfig
 from sglang.srt.configs.mamba_utils import KimiLinearStateShape
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestGlm5NextTextConfig(CustomTestCase):
+class TestGlm5NextTextConfig(unittest.TestCase):
+    def test_transformers_mlp_plan_preserves_dense_prefix_and_mhc(self):
+        config = Glm5NextTextConfig(
+            num_hidden_layers=4,
+            mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
+        )
+
+        self.assertEqual(config.first_k_dense_replace, 1)
+        self.assertTrue(config.mhc)
+        self.assertEqual(
+            config.mlp_layer_types, ["dense", "sparse", "sparse", "sparse"]
+        )
+
+    def test_transformers_mlp_plan_preserves_explicit_mhc_override(self):
+        config = Glm5NextTextConfig(
+            num_hidden_layers=4,
+            mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
+            mhc=False,
+        )
+
+        self.assertFalse(config.mhc)
+        self.assertEqual(config.first_k_dense_replace, 1)
+
+    def test_legacy_defaults_without_transformers_mlp_plan_are_preserved(self):
+        config = Glm5NextTextConfig(num_hidden_layers=4)
+
+        self.assertEqual(config.first_k_dense_replace, 3)
+        self.assertFalse(config.mhc)
+
+    def test_transformers_mlp_plan_checks_legacy_frequency(self):
+        config = Glm5NextTextConfig(
+            num_hidden_layers=5,
+            mlp_layer_types=["dense", "dense", "sparse", "dense", "sparse"],
+            moe_layer_freq=2,
+        )
+
+        self.assertEqual(config.first_k_dense_replace, 2)
+        self.assertEqual(config.moe_layer_freq, 2)
+
+    def test_transformers_mlp_plan_rejects_invalid_or_conflicting_metadata(self):
+        cases = [
+            {"mlp_layer_types": ["dense", "sparse"]},
+            {"mlp_layer_types": ["dense", "sparse", "invalid", "sparse"]},
+            {
+                "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+                "first_k_dense_replace": 3,
+            },
+            {
+                "mlp_layer_types": ["dense", "sparse", "dense", "sparse"],
+            },
+            {
+                "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+                "n_routed_experts": None,
+            },
+        ]
+        for kwargs in cases:
+            with (
+                self.subTest(kwargs=kwargs),
+                self.assertRaisesRegex(ValueError, "mlp_layer_types"),
+            ):
+                Glm5NextTextConfig(num_hidden_layers=4, **kwargs)
+
+    def test_transformers_all_dense_plan_has_no_sparse_suffix(self):
+        config = Glm5NextTextConfig(
+            num_hidden_layers=4,
+            mlp_layer_types=["dense"] * 4,
+            n_routed_experts=None,
+        )
+
+        self.assertEqual(config.first_k_dense_replace, 4)
+
     def test_pinned_transformers_registers_glm5_next(self):
         config = AutoConfig.for_model("glm5_next")
 

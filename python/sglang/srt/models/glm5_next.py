@@ -886,7 +886,7 @@ class Glm5NextDecoderLayer(nn.Module):
         return is_nextn or (
             self.config.n_routed_experts is not None
             and layer_id >= self.config.first_k_dense_replace
-            and layer_id % self.config.moe_layer_freq == 0
+            and layer_id % (self.config.moe_layer_freq or 1) == 0
         )
 
     def forward(

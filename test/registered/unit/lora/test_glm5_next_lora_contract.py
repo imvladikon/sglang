@@ -17,6 +17,7 @@ from sglang.srt.lora.utils import (
     get_default_hidden_dim,
 )
 from sglang.srt.models.glm5_next import (
+    Glm5NextDecoderLayer,
     Glm5NextForConditionalGeneration,
     _can_fuse_kda_projections,
 )
@@ -57,6 +58,46 @@ def _fake_model(*, layers=45, experts=288):
     model = Glm5NextForConditionalGeneration.__new__(Glm5NextForConditionalGeneration)
     model.config = config
     return model
+
+
+def test_transformers_dense_prefix_matches_decoder_and_lora_geometry():
+    config = Glm5NextTextConfig(
+        num_hidden_layers=4,
+        hidden_size=32,
+        intermediate_size=96,
+        moe_intermediate_size=16,
+        n_shared_experts=1,
+        mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
+    )
+    model = SimpleNamespace(config=config)
+    model._lora_is_sparse_layer = lambda index: (
+        Glm5NextForConditionalGeneration._lora_is_sparse_layer(model, index)
+    )
+    for index, expected in enumerate([False, True, True, True]):
+        assert Glm5NextDecoderLayer._is_layer_sparse(model, index, False) == expected
+        assert model._lora_is_sparse_layer(index) == expected
+        intermediate = 16 if expected else 96
+        assert Glm5NextForConditionalGeneration.get_hidden_dim(
+            model, "gate_up_proj", index
+        ) == (32, 2 * intermediate)
+        assert Glm5NextForConditionalGeneration.get_hidden_dim(
+            model, "down_proj", index
+        ) == (intermediate, 32)
+
+
+def test_null_legacy_moe_frequency_is_shared_by_decoder_and_lora():
+    config = Glm5NextTextConfig(
+        num_hidden_layers=4, first_k_dense_replace=1, moe_layer_freq=None
+    )
+    model = SimpleNamespace(config=config)
+    for index, expected in enumerate([False, True, True, True]):
+        assert Glm5NextDecoderLayer._is_layer_sparse(model, index, False) == expected
+        assert (
+            Glm5NextForConditionalGeneration._lora_is_sparse_layer(model, index)
+            == expected
+        )
+    assert not Glm5NextDecoderLayer._is_layer_sparse(model, -1, False)
+    assert Glm5NextDecoderLayer._is_layer_sparse(model, 4, True)
 
 
 def test_full_and_9b_layer_counts_match_the_contract():

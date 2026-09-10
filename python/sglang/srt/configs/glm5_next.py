@@ -113,7 +113,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         routed_scaling_factor: float = 2.5,
         scoring_func: str = "sigmoid",
         topk_method: str = "noaux_tc",
-        first_k_dense_replace: int = 3,
+        first_k_dense_replace: int | None = None,
         moe_layer_freq: int = 1,
         q_lora_rank: Optional[int] = 1536,
         kv_lora_rank: int = 512,
@@ -121,7 +121,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         qk_rope_head_dim: int = 0,
         v_head_dim: int = 256,
         swiglu_limit: Optional[float] = None,
-        mhc: bool = False,
+        mhc: bool | None = None,
         hc_mult: int = 4,
         hc_sinkhorn_iters: int = 20,
         hc_eps: float = 1e-6,
@@ -140,6 +140,41 @@ class Glm5NextTextConfig(PretrainedConfig):
         index_skip_topk_offset: Optional[int] = None,
         **kwargs,
     ):
+        mlp_layer_types = kwargs.get("mlp_layer_types")
+        if mlp_layer_types is not None:
+            if len(mlp_layer_types) != num_hidden_layers or any(
+                kind not in {"dense", "sparse"} for kind in mlp_layer_types
+            ):
+                raise ValueError("Invalid GLM mlp_layer_types")
+            if first_k_dense_replace is None:
+                first_k_dense_replace = next(
+                    (i for i, kind in enumerate(mlp_layer_types) if kind == "sparse"),
+                    num_hidden_layers,
+                )
+            frequency = moe_layer_freq or 1
+            if frequency < 1:
+                raise ValueError("Invalid GLM mlp_layer_types frequency")
+            native_layout = [
+                "sparse"
+                if n_routed_experts
+                and i >= first_k_dense_replace
+                and i % frequency == 0
+                else "dense"
+                for i in range(num_hidden_layers)
+            ]
+            if list(mlp_layer_types) != native_layout:
+                raise ValueError(
+                    "GLM mlp_layer_types conflicts with the native dense-prefix/"
+                    "moe_layer_freq layout"
+                )
+        elif first_k_dense_replace is None:
+            first_k_dense_replace = 3
+
+        # Transformers' explicit MLP layout belongs to its mHC architecture.
+        # Keep native defaults and an explicitly supplied mhc flag unchanged.
+        if mhc is None:
+            mhc = mlp_layer_types is not None
+
         if rope_scaling is None and rope_parameters is not None:
             rope_scaling = rope_parameters
         if rope_parameters is not None:
@@ -223,9 +258,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         )
         linear_attn_config.setdefault("head_dim", linear_head_dim)
         linear_attn_config.setdefault("num_heads", linear_num_heads)
-        linear_attn_config.setdefault(
-            "short_conv_kernel_size", linear_conv_kernel_dim
-        )
+        linear_attn_config.setdefault("short_conv_kernel_size", linear_conv_kernel_dim)
         linear_attn_config.setdefault("gate_lower_bound", self.gate_lower_bound)
         self.linear_attn_config = linear_attn_config
         self.index_head_dim = index_head_dim
