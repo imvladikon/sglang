@@ -10,6 +10,8 @@ class DSAPagedMQALogitsBackend(Enum):
     DEEPGEMM = "deepgemm"
     CUTEDSL = "cutedsl"
     AITER = "aiter"
+    TORCH = "torch"
+    TRITON = "triton"
 
     def is_deepgemm(self) -> bool:
         return self == DSAPagedMQALogitsBackend.DEEPGEMM
@@ -19,6 +21,12 @@ class DSAPagedMQALogitsBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == DSAPagedMQALogitsBackend.AITER
+
+    def is_torch(self) -> bool:
+        return self == DSAPagedMQALogitsBackend.TORCH
+
+    def is_triton(self) -> bool:
+        return self == DSAPagedMQALogitsBackend.TRITON
 
     @staticmethod
     def resolve(value: str) -> DSAPagedMQALogitsBackend:
@@ -30,6 +38,10 @@ class DSAPagedMQALogitsBackend(Enum):
                 )
             return DSAPagedMQALogitsBackend.AITER
 
+        if value == "torch":
+            return DSAPagedMQALogitsBackend.TORCH
+        if value == "triton":
+            return DSAPagedMQALogitsBackend.TRITON
         if value == "auto" or value == "deepgemm":
             return DSAPagedMQALogitsBackend.DEEPGEMM
         if value == "aiter":

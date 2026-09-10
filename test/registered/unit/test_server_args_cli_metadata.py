@@ -101,6 +101,32 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 self.assertEqual(server_args.dsa_prefill_backend, "torch")
                 self.assertEqual(server_args.dsa_decode_backend, "torch")
                 self.assertEqual(server_args.dsa_topk_backend, "torch")
+    def test_dsa_fallback_backends_survive_field_migration(self):
+        for backend in ("torch", "triton"):
+            for prefix in ("dsa", "nsa"):
+                with self.subTest(backend=backend, prefix=prefix):
+                    argv = [
+                        "--model",
+                        "dummy",
+                        f"--{prefix}-prefill-backend",
+                        backend,
+                        f"--{prefix}-decode-backend",
+                        backend,
+                        "--dsa-paged-mqa-logits-backend",
+                        backend,
+                    ]
+                    if prefix == "nsa":
+                        # Upstream retired these aliases; retain fallback support
+                        # through the canonical DSA options only.
+                        with self.assertRaises(SystemExit) as retired:
+                            self.parser.parse_args(argv)
+                        self.assertEqual(retired.exception.code, 2)
+                        continue
+                    args = self.parser.parse_args(argv)
+                    server_args = ServerArgs.from_cli_args(args)
+                    self.assertEqual(server_args.dsa_prefill_backend, backend)
+                    self.assertEqual(server_args.dsa_decode_backend, backend)
+                    self.assertEqual(server_args.dsa_paged_mqa_logits_backend, backend)
 
     def test_migrated_and_manual_options_parse_together(self):
         args = self.parser.parse_args(

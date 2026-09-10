@@ -29,6 +29,7 @@ class MockDSATokenToKVPool:
         self.page_size = page_size
         self.index_head_dim = index_head_dim
         self.quant_block_size = quant_block_size
+        self.indexer_quant_block_size = index_head_dim
         self.device = device
 
 

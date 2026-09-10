@@ -197,6 +197,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "triton",
                 "torch",
             ],
             resolvable=True,
@@ -228,6 +229,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "triton",
                 "torch",
             ],
             resolvable=True,
@@ -249,8 +251,8 @@ class ExecKernel(msgspec.Struct):
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
-            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
-            choices=["auto", "deepgemm", "cutedsl", "aiter"],
+            help="DSA indexer MQA logits backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (SM100 only), 'aiter' (ROCm only), 'triton' (E4M3 storage with BF16 compute on SM80+), or the architecture-independent correctness fallback 'torch'.",
+            choices=["auto", "deepgemm", "cutedsl", "aiter", "triton", "torch"],
         ),
     ] = "auto"
     dsa_topk_backend: A[

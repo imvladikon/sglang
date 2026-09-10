@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.attention.dsa.indexer_layout import indexer_quant_block_size
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
@@ -79,7 +80,7 @@ class GetK:
 
         # flat_indices: (num_pages, num_k_bytes_per_page), int32, element := an index into flat_buf that we want to access
         flat_indices = (page_indices * buf_numel_per_page)[:, None] + torch.arange(
-            num_k_bytes_per_page, dtype=torch.int32, device="cuda"
+            num_k_bytes_per_page, dtype=torch.int32, device=buf.device
         )[None, :]
         flat_indices = flat_indices.flatten()[: seq_len * num_k_bytes_per_token]
 
@@ -115,7 +116,7 @@ class GetS:
     ):
         num_pages = (seq_len + pool.page_size - 1) // pool.page_size
         seq_len_ = num_pages * pool.page_size
-        assert pool.index_head_dim // pool.quant_block_size == 1
+        assert pool.index_head_dim // pool.indexer_quant_block_size == 1
         index_k_scale_fp8 = torch.empty(
             (seq_len_, 4),
             dtype=torch.uint8,
@@ -139,13 +140,13 @@ class GetS:
         buf_numel_per_page = buf.shape[1]
 
         num_s_bytes_per_page = buf.shape[1] - pool.page_size * pool.index_head_dim
-        num_s_bytes_per_token = pool.index_head_dim // pool.quant_block_size * 4
+        num_s_bytes_per_token = pool.index_head_dim // pool.indexer_quant_block_size * 4
         s_offset_in_page = pool.page_size * pool.index_head_dim
 
         flat_buf = buf.flatten()
         flat_indices = (
             (page_indices * buf_numel_per_page)[:, None]
-            + torch.arange(num_s_bytes_per_page, dtype=torch.int32, device="cuda")[
+            + torch.arange(num_s_bytes_per_page, dtype=torch.int32, device=buf.device)[
                 None, :
             ]
             + s_offset_in_page
@@ -198,7 +199,7 @@ class GetKAndS:
 
         page_size = pool.page_size
         index_head_dim = pool.index_head_dim
-        quant_block_size = pool.quant_block_size
+        quant_block_size = pool.indexer_quant_block_size
         scale_elems = index_head_dim // quant_block_size
 
         kv_cache = buf.view(-1, page_size, index_head_dim + scale_elems * 4).view(
@@ -335,17 +336,16 @@ def _set_k_and_s_triton(
     assert index_k.is_contiguous()
     assert index_k_scale.is_contiguous()
 
-    if _is_fp8_fnuz:
-        buf_fp8 = buf.view(torch.float8_e4m3fnuz)
-    else:
-        buf_fp8 = buf.view(torch.float8_e4m3fn)
+    # K is already quantized: copy its bytes without FP8 instructions. Even
+    # typed FP8 loads/stores are rejected by Triton on SM80.
+    index_k_bytes = index_k.view(torch.uint8)
     buf_fp32 = buf.view(torch.float32)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
-        buf_fp8,
+        buf,
         buf_fp32,
         loc,
-        index_k,
+        index_k_bytes,
         index_k_scale,
         index_k.stride(0),
         PAGE_SIZE=page_size,
@@ -358,7 +358,7 @@ def _set_k_and_s_triton(
 
 @triton.jit
 def _set_k_and_s_triton_kernel(
-    buf_fp8_ptr,
+    buf_k_bytes_ptr,
     buf_fp32_ptr,
     loc_ptr,
     index_k_ptr,
@@ -376,7 +376,7 @@ def _set_k_and_s_triton_kernel(
 
     in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
 
-    # no need for `mask`, since we read 128B for k and 4B for scale, both pow of 2
+    # No mask needed: K has 64 or 128 bytes and its scale has 4 bytes.
     k = tl.load(index_k_ptr + in_k_offsets)
     k_scale = tl.load(index_k_scale_ptr + token_id)
 
@@ -411,7 +411,7 @@ def _set_k_and_s_triton_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, k)
+    tl.store(buf_k_bytes_ptr + out_k_offsets, k)
     tl.store(buf_fp32_ptr + out_s_offset, k_scale)
 
 
