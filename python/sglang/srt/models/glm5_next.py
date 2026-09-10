@@ -125,6 +125,56 @@ logger = logging.getLogger(__name__)
 _GLM_AITER_FUSED_MHC_LOGGED = False
 
 
+def _iter_glm5_next_checkpoint_weights(weights, num_experts):
+    """Normalize Transformers exports to the native, shard-aware loaders.
+
+    Transformers stores KDA convolutions and routed experts as packed tensors,
+    and nests the forget gate and hyperconnection parameters in submodules.
+    Yield views so tensor parallel and expert parallel slicing still happens in
+    the existing weight loaders without copying or changing checkpoint dtypes.
+    """
+    for name, weight in weights:
+        name = name.replace(".self_attn.forget_gate.", ".self_attn.")
+        for source, target in (("attn_hc", "hc_attn"), ("ffn_hc", "hc_ffn")):
+            for suffix in ("base", "scale", "fn"):
+                name = name.replace(f".{source}.{suffix}", f".{target}_{suffix}")
+
+        if name.endswith(".self_attn.conv1d.weight"):
+            if (
+                weight.ndim != 3
+                or weight.shape[0] == 0
+                or weight.shape[0] % 3
+                or weight.shape[1] != 1
+            ):
+                raise ValueError(f"Invalid GLM convolution checkpoint shape: {name}")
+            prefix = name.removesuffix(".conv1d.weight")
+            for projection, chunk in zip(("q", "k", "v"), weight.chunk(3, dim=0)):
+                yield f"{prefix}.{projection}_conv1d.weight", chunk
+            continue
+
+        packed_gate_up = name.endswith(".mlp.experts.gate_up_proj")
+        packed_down = name.endswith(".mlp.experts.down_proj")
+        if packed_gate_up or packed_down:
+            if (
+                weight.ndim != 3
+                or weight.shape[0] != num_experts
+                or any(dim == 0 for dim in weight.shape)
+                or (packed_gate_up and weight.shape[1] % 2)
+            ):
+                raise ValueError(f"Invalid GLM packed expert checkpoint shape: {name}")
+            prefix = name.rsplit(".", 1)[0]
+            for expert_id in range(num_experts):
+                if packed_gate_up:
+                    gate, up = weight[expert_id].chunk(2, dim=0)
+                    yield f"{prefix}.{expert_id}.gate_proj.weight", gate
+                    yield f"{prefix}.{expert_id}.up_proj.weight", up
+                else:
+                    yield f"{prefix}.{expert_id}.down_proj.weight", weight[expert_id]
+            continue
+
+        yield name, weight
+
+
 def _can_fuse_kda_projections(
     quant_config: Optional[QuantizationConfig],
     head_shard_size: int,
@@ -1567,7 +1617,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return name
 
         weight_names = []
-        for name, loaded_weight in weights:
+        for name, loaded_weight in _iter_glm5_next_checkpoint_weights(
+            weights, self.config.n_routed_experts
+        ):
             is_visual_weight = "visual" in name
             if getattr(self, "encoder_only", False) and not is_visual_weight:
                 continue
