@@ -169,6 +169,19 @@ REASONING_MODE_RULES = (
         ),
     ),
     DetectionRule(
+        # GLM-5.3 and GLM-5.3-Flash reason unconditionally: the enable_thinking
+        # toggle GLM-5.2 had is gone from their templates. Without a mode rule
+        # their reasoning config stays None, they drop out of the GLM family
+        # checks and end up on a tool parser that cannot read their calls.
+        name="glm_always_on_reasoning",
+        value=ReasoningToggleConfig(special_case="always"),
+        predicate=lambda ctx: (
+            ctx.has_text("[gMASK]<sop>")
+            and ctx.has_text("</think>")
+            and not ctx.has_text("enable_thinking")
+        ),
+    ),
+    DetectionRule(
         name="mistral_reasoning_effort",
         value=ReasoningToggleConfig(special_case="mistral"),
         predicate=lambda ctx: (
@@ -323,6 +336,15 @@ def _is_nemotron_3(ctx):
 
 
 def _is_glm45(ctx):
+    # GLM-5.3 and GLM-5.3-Flash dropped the enable_thinking toggle and reason
+    # unconditionally, so requiring the toggle drops them out of the family and
+    # they fall through to a parser that cannot read their tool calls. Accept
+    # either the toggle or always-on reasoning; the remaining conditions
+    # ([gMASK]<sop> plus the GLM vocabulary) still carry the family signature.
+    reasoning = ctx.reasoning_config
+    reasoning_ok = reasoning == ReasoningToggleConfig(
+        toggle_param="enable_thinking", default_enabled=True
+    ) or (reasoning is not None and reasoning.always_on)
     return (
         (
             ctx.has_text("[gMASK]<sop>")
@@ -330,15 +352,15 @@ def _is_glm45(ctx):
             or ctx.has_pattern(r"(?<!<)/think")
         )
         and ctx.has_vocab("<tool_call>")
-        and ctx.reasoning_config
-        == ReasoningToggleConfig(toggle_param="enable_thinking", default_enabled=True)
+        and reasoning_ok
         and (ctx.has_vocab("<|user|>") or ctx.has_vocab("<|endoftext|>"))
     )
 
 
 def _is_glm47(ctx):
+    # GLM-5.3-Flash builds the tool call with Jinja `~` instead of `+`.
     return _is_glm45(ctx) and ctx.has_pattern(
-        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*\+\s*tc\.name"
+        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*[+~]\s*tc\.name"
     )
 
 
