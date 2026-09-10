@@ -853,6 +853,7 @@ class Scheduler(
                     self.ipc_channels.recv_from_tokenizer,
                     self.ipc_channels.recv_from_rpc,
                 ],
+                can_empty_cache=lambda: not self._engine_paused,
             )
         else:
             self.idle_sleeper = None
@@ -2266,7 +2267,9 @@ class Scheduler(
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
-        self.idle_sleeper = RustServerIdleSleeper(rust_server)
+        self.idle_sleeper = RustServerIdleSleeper(
+            rust_server, can_empty_cache=lambda: not self._engine_paused
+        )
 
     def rust_server_tokenizer_path(self) -> str:
         return get_serving().tokenizer_path
@@ -3582,6 +3585,7 @@ class Scheduler(
             running_batch.filter_batch()
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
+                running_batch.is_prefill_only = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -3816,6 +3820,9 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if adder.chunk_budget_exhausted():
+                break
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4621,7 +4628,7 @@ class Scheduler(
             )
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
+        while self.return_health_check_ipcs:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.

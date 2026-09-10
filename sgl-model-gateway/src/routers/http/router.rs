@@ -30,7 +30,6 @@ use crate::{
         common::GenerationRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        generate::GenerateRequest,
         rerank::{RerankRequest, RerankResponse, RerankResult},
         responses::{ResponsesGetParams, ResponsesRequest},
     },
@@ -39,7 +38,7 @@ use crate::{
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
         streaming_utils::BreakerTrackedStream,
-        RouterTrait,
+        GenerateRequestWithExtensions, RouterTrait,
     },
 };
 
@@ -749,7 +748,7 @@ impl RouterTrait for Router {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
+        body: &GenerateRequestWithExtensions,
         model_id: Option<&str>,
     ) -> Response {
         self.route_typed_request(headers, body, "/generate", model_id)

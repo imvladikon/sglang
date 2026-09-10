@@ -704,18 +704,54 @@ class TestEagleConfigurator(CustomTestCase):
         mr.spec_algorithm.is_none.return_value = False
         mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
 
-        with mock_cpu_env():
-            from sglang.srt.model_executor.pool_configurator import (
-                create_memory_pool_configurator,
-            )
+        full_pt = _full_per_token(mr)
+        for dcp_size in (1, 4):
+            with self.subTest(dcp_size=dcp_size):
+                with (
+                    mock_cpu_env(),
+                    get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        create_memory_pool_configurator,
+                    )
 
-            cfg = create_memory_pool_configurator(mr)
-            config = cfg.calculate_pool_sizes(available, 1)
+                    cfg = create_memory_pool_configurator(mr)
+                    config = cfg.calculate_pool_sizes(available, 1)
+
+                total_layers = num_layers + eagle_draft_num_layers * dcp_size
+                used = config.max_total_num_tokens * full_pt * total_layers
+                self.assertLessEqual(used, available)
+
+    def test_hybrid_swa_scales_draft_budget_with_dcp(self):
+        ratio = 0.5
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(16)),
+            swa_attention_layer_ids=list(range(16, 32)),
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=ratio,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 4
 
         full_pt = _full_per_token(mr)
-        total_layers = num_layers + eagle_draft_num_layers
-        used = config.max_total_num_tokens * full_pt * total_layers
-        self.assertLessEqual(used, available)
+        swa_pt = _swa_per_token(mr)
+        for dcp_size in (1, 4):
+            with self.subTest(dcp_size=dcp_size):
+                with (
+                    mock_cpu_env(),
+                    get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        create_memory_pool_configurator,
+                    )
+
+                    cfg = create_memory_pool_configurator(mr)
+
+                expected = full_pt * (16 + 4 * dcp_size) + ratio * swa_pt * 16
+                self.assertEqual(cfg._cell_size, expected)
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",

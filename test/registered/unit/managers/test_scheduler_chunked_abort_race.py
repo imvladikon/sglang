@@ -19,10 +19,12 @@ class _FakeReq:
 
     def __init__(self, rid: str):
         self.rid = rid
-        # Mirrors Req.kv; the abort paths read only these two predicates.
-        self.kv = SimpleNamespace(holds_kv=True, holds_mamba=False)
+        self.req_pool_idx = 1
+        self.mamba_pool_idx = None
         self.to_finish = None
         self._finished = False
+        # Mirrors Req.kv; the abort paths read only these two predicates.
+        self.kv = SimpleNamespace(holds_kv=True, holds_mamba=False)
 
     def finished(self):
         return self._finished

@@ -42,7 +42,7 @@ use crate::{
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
         streaming_utils::BreakerTrackedStream,
-        RouterTrait,
+        GenerateRequestWithExtensions, RouterTrait,
     },
 };
 
@@ -1562,7 +1562,7 @@ impl RouterTrait for PDRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
+        body: &GenerateRequestWithExtensions,
         model_id: Option<&str>,
     ) -> Response {
         let is_stream = body.stream;

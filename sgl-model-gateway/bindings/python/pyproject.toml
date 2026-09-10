@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+requires = ["maturin>=1.0,<2.0", "protoc-wheel-0"]
 build-backend = "maturin"
 
 [project]
@@ -32,6 +32,7 @@ dependencies = [
     "setproctitle",
     "aiohttp",
     "orjson",
+    "pybase64",
     "uvicorn",
     "fastapi",
 ]
@@ -51,6 +52,10 @@ sglang-router = "sglang_router.cli:main"
 [tool.maturin]
 python-source = "src"
 module-name = "sglang_router.sglang_router_rs"
+# Source installs run through PEP 517 and cannot pass the production-wheel
+# command-line flag documented by the gateway. Build OpenSSL from source so
+# the Git package does not require system libssl development headers.
+features = ["vendored-openssl"]
 # Exclude bindings/python/README.md to use root README only
 exclude = ["README.md"]
 

@@ -99,7 +99,14 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_forward, get_mm, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_lora,
+    get_mm,
+    get_parallel,
+    get_server_args,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -116,6 +123,70 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+_GLM_AITER_FUSED_MHC_LOGGED = False
+
+
+def _iter_glm5_next_checkpoint_weights(weights, num_experts):
+    """Normalize Transformers exports to the native, shard-aware loaders.
+
+    Transformers stores KDA convolutions and routed experts as packed tensors,
+    and nests the forget gate and hyperconnection parameters in submodules.
+    Yield views so tensor parallel and expert parallel slicing still happens in
+    the existing weight loaders without copying or changing checkpoint dtypes.
+    """
+    for name, weight in weights:
+        name = name.replace(".self_attn.forget_gate.", ".self_attn.")
+        for source, target in (("attn_hc", "hc_attn"), ("ffn_hc", "hc_ffn")):
+            for suffix in ("base", "scale", "fn"):
+                name = name.replace(f".{source}.{suffix}", f".{target}_{suffix}")
+
+        if name.endswith(".self_attn.conv1d.weight"):
+            if (
+                weight.ndim != 3
+                or weight.shape[0] == 0
+                or weight.shape[0] % 3
+                or weight.shape[1] != 1
+            ):
+                raise ValueError(f"Invalid GLM convolution checkpoint shape: {name}")
+            prefix = name.removesuffix(".conv1d.weight")
+            for projection, chunk in zip(("q", "k", "v"), weight.chunk(3, dim=0)):
+                yield f"{prefix}.{projection}_conv1d.weight", chunk
+            continue
+
+        packed_gate_up = name.endswith(".mlp.experts.gate_up_proj")
+        packed_down = name.endswith(".mlp.experts.down_proj")
+        if packed_gate_up or packed_down:
+            if (
+                weight.ndim != 3
+                or weight.shape[0] != num_experts
+                or any(dim == 0 for dim in weight.shape)
+                or (packed_gate_up and weight.shape[1] % 2)
+            ):
+                raise ValueError(f"Invalid GLM packed expert checkpoint shape: {name}")
+            prefix = name.rsplit(".", 1)[0]
+            for expert_id in range(num_experts):
+                if packed_gate_up:
+                    gate, up = weight[expert_id].chunk(2, dim=0)
+                    yield f"{prefix}.{expert_id}.gate_proj.weight", gate
+                    yield f"{prefix}.{expert_id}.up_proj.weight", up
+                else:
+                    yield f"{prefix}.{expert_id}.down_proj.weight", weight[expert_id]
+            continue
+
+        yield name, weight
+
+
+def _can_fuse_kda_projections(
+    quant_config: Optional[QuantizationConfig],
+    head_shard_size: int,
+    tensor_parallel_size: int,
+) -> bool:
+    """Whether the fused KDA layout is compatible with the active runtime."""
+    return (
+        quant_config is None
+        and head_shard_size == tensor_parallel_size
+        and not get_lora().enable_lora
+    )
 
 
 @torch.compile
@@ -337,7 +408,13 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # The generic LoRA runtime wraps the individual KDA projections, not
+        # MergedColumnParallelRepeatedLinear/ColumnParallelBatchedLinear.
+        self.do_fuse_qkvbfg = _can_fuse_kda_projections(
+            quant_config,
+            head_shard_size,
+            self.tp_size,
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -698,6 +775,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
+                hc_attn_to_mlp=(self.hc_attn_to_mlp if _use_aiter_gfx95 else None),
             )
             self.layer_communicator = MHCLayerCommunicator(
                 **shared_kwargs,
@@ -754,11 +832,62 @@ class Glm5NextDecoderLayer(nn.Module):
             hc_mult=self.config.hc_mult,
         )
 
+    def hc_attn_to_mlp(
+        self,
+        hidden_states,
+        residual,
+        h_res,
+        h_post,
+        out_norm_weight,
+        out_norm_eps,
+    ):
+        global _GLM_AITER_FUSED_MHC_LOGGED
+
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+            apply_mhc_post_pre_boundary,
+        )
+
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens == 0:
+            return None
+        hc_mult = self.config.hc_mult
+        fused = apply_mhc_post_pre_boundary(
+            layer_input=hidden_states,
+            residual=residual.view(num_tokens, hc_mult, hidden_size),
+            post=h_post.view(num_tokens, hc_mult),
+            comb=h_res.view(num_tokens, hc_mult, hc_mult),
+            hc_fn=self.hc_ffn_fn,
+            hc_scale=self.hc_ffn_scale,
+            hc_base=self.hc_ffn_base,
+            hc_mult=hc_mult,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            hc_post_mult=2.0,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            norm_weight=out_norm_weight,
+            norm_eps=out_norm_eps,
+            fn_transpose=True,
+        )
+        if fused is None:
+            return None
+        if not _GLM_AITER_FUSED_MHC_LOGGED:
+            logger.info("Using fused AITER mHC attention-to-FFN boundary")
+            _GLM_AITER_FUSED_MHC_LOGGED = True
+
+        next_residual, layer_input, next_h_post, next_h_res, norm_fused = fused
+        return (
+            layer_input,
+            next_residual.view(num_tokens, -1),
+            next_h_res.reshape(num_tokens, hc_mult * hc_mult),
+            next_h_post.reshape(num_tokens, hc_mult),
+            norm_fused,
+        )
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
             and layer_id >= self.config.first_k_dense_replace
-            and layer_id % self.config.moe_layer_freq == 0
+            and layer_id % (self.config.moe_layer_freq or 1) == 0
         )
 
     def forward(
@@ -1102,6 +1231,75 @@ class Glm5NextForConditionalGeneration(nn.Module):
     }
     fall_back_to_pt_during_load = False
 
+    supported_lora_modules = [
+        # KDA attention. q/k/v are stacked in the serving-side qkv buffer.
+        "qkv_proj",
+        "o_proj",
+        "b_proj",
+        "f_a_proj",
+        "f_b_proj",
+        "g_a_proj",
+        "g_b_proj",
+        # DSA MLA. Indexer projections remain explicit opt-ins.
+        "fused_qkv_a_proj_with_mqa",
+        "q_b_proj",
+        "kv_b_proj",
+        # Dense MLP, shared expert, and routed experts.
+        "gate_up_proj",
+        "down_proj",
+        "embed_tokens",
+        "lm_head",
+    ]
+
+    def _lora_is_sparse_layer(self, layer_idx: int) -> bool:
+        config = self.config
+        moe_frequency = getattr(config, "moe_layer_freq", 1) or 1
+        return (
+            getattr(config, "n_routed_experts", None) is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % moe_frequency == 0
+        )
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """Return the physical LoRA geometry for one hybrid decoder layer."""
+        from sglang.srt.lora.utils import get_default_hidden_dim
+
+        config = self.config
+        linear_config = config.linear_attn_config
+        kda_heads = linear_config["num_heads"]
+        kda_head_dim = linear_config["head_dim"]
+        kda_projection = kda_heads * kda_head_dim
+
+        if module_name == "qkv_proj":
+            return config.hidden_size, 3 * kda_projection
+        if module_name == "o_proj":
+            input_dim = (
+                kda_projection
+                if config.is_kda_layer(layer_idx)
+                else config.num_attention_heads * config.v_head_dim
+            )
+            return input_dim, config.hidden_size
+        if module_name in {"f_a_proj", "g_a_proj"}:
+            return config.hidden_size, kda_head_dim
+        if module_name in {"f_b_proj", "g_b_proj"}:
+            return kda_head_dim, kda_projection
+        if module_name == "b_proj":
+            return config.hidden_size, kda_heads
+        if module_name in {"gate_up_proj", "down_proj"}:
+            intermediate = config.intermediate_size
+            if self._lora_is_sparse_layer(layer_idx):
+                intermediate = config.moe_intermediate_size * (
+                    config.n_shared_experts or 1
+                )
+            if module_name == "gate_up_proj":
+                return config.hidden_size, 2 * intermediate
+            return intermediate, config.hidden_size
+        if module_name == "gate_up_proj_moe":
+            return config.hidden_size, 2 * config.moe_intermediate_size
+        if module_name == "down_proj_moe":
+            return config.moe_intermediate_size, config.hidden_size
+        return get_default_hidden_dim(module_name, config, layer_idx)
+
     def __init__(
         self,
         config: Glm5NextConfig,
@@ -1119,6 +1317,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             not self.encoder_only
             and getattr(text_config, "q_lora_rank", None) is not None
         )
+        self._weight_update_a_proj_cache: Optional[dict[str, torch.Tensor]] = None
 
         self.pp_group = get_pp_group()
         self.config = text_config
@@ -1414,7 +1613,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
             ]
 
         fuse_qkv_a_proj = getattr(self, "fuse_qkv_a_proj", False)
-        cached_a_proj: dict[str, torch.Tensor] = {} if fuse_qkv_a_proj else None
+        transaction_cache = getattr(self, "_weight_update_a_proj_cache", None)
+        persistent_a_proj_cache = fuse_qkv_a_proj and transaction_cache is not None
+        cached_a_proj: Optional[dict[str, torch.Tensor]] = (
+            transaction_cache
+            if persistent_a_proj_cache
+            else ({} if fuse_qkv_a_proj else None)
+        )
         qc = self.quant_config
         if qc is not None and qc.get_name() in {"awq", "awq_marlin", "moe_wna16"}:
             fused_cat_dim = 1
@@ -1422,8 +1627,18 @@ class Glm5NextForConditionalGeneration(nn.Module):
             fused_cat_dim = 0
 
         params_dict = dict(self.named_parameters())
+
+        def maybe_map_fp8_block_scale_name(name: str) -> str:
+            if name.endswith(".weight_scale"):
+                candidate = name.removesuffix(".weight_scale") + ".weight_scale_inv"
+                if candidate in params_dict:
+                    return candidate
+            return name
+
         weight_names = []
-        for name, loaded_weight in weights:
+        for name, loaded_weight in _iter_glm5_next_checkpoint_weights(
+            weights, self.config.n_routed_experts
+        ):
             is_visual_weight = "visual" in name
             if getattr(self, "encoder_only", False) and not is_visual_weight:
                 continue
@@ -1485,6 +1700,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 candidate = name.replace(weight_name, param_name)
+                candidate = maybe_map_fp8_block_scale_name(candidate)
                 if (
                     param_name
                     in {
@@ -1513,6 +1729,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         continue
                     is_expert_weight = True
                     name = name.replace(weight_name, param_name)
+                    name = maybe_map_fp8_block_scale_name(name)
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -1534,7 +1752,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     if fuse_qkv_a_proj and (
                         "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                     ):
-                        cached_a_proj[name] = loaded_weight
+                        cached_a_proj[name] = (
+                            loaded_weight.detach().clone()
+                            if persistent_a_proj_cache
+                            else loaded_weight
+                        )
                         q_a_proj_name = (
                             name
                             if "q_a_proj" in name
@@ -1574,6 +1796,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
 
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
 
@@ -1597,6 +1820,33 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
+
+    def begin_weight_update_transaction(self) -> None:
+        """Keep fused MLA inputs alive across streamed update buckets."""
+        if not self.fuse_qkv_a_proj:
+            return
+        if self._weight_update_a_proj_cache:
+            raise RuntimeError(
+                "Cannot begin a GLM weight update with pending fused MLA tensors: "
+                + ", ".join(sorted(self._weight_update_a_proj_cache))
+            )
+        self._weight_update_a_proj_cache = {}
+
+    def finalize_weight_update_transaction(self) -> None:
+        """Reject updates that did not provide both halves of an MLA fusion."""
+        if not self.fuse_qkv_a_proj:
+            return
+        pending = self._weight_update_a_proj_cache or {}
+        self._weight_update_a_proj_cache = None
+        if pending:
+            raise RuntimeError(
+                "Incomplete GLM fused MLA weight update; missing a q_a_proj or "
+                "kv_a_proj_with_mqa counterpart for: " + ", ".join(sorted(pending))
+            )
+
+    def abort_weight_update_transaction(self) -> None:
+        """Drop cached MLA shards after any failed online update."""
+        self._weight_update_a_proj_cache = None
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:

@@ -30,7 +30,7 @@ use crate::{
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{error, GenerateRequestWithExtensions, RouterTrait},
 };
 
 /// gRPC router implementation for SGLang
@@ -377,10 +377,17 @@ impl RouterTrait for GrpcRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
+        body: &GenerateRequestWithExtensions,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_generate_impl(headers, body, model_id).await
+        if !body.extensions.is_empty() {
+            return error::bad_request(
+                "unsupported_generate_extensions",
+                "The gRPC backend does not support native /generate extensions",
+            );
+        }
+        self.route_generate_impl(headers, &body.request, model_id)
+            .await
     }
 
     async fn route_chat(

@@ -7,7 +7,7 @@ import unittest
 from array import array
 from http import HTTPStatus
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.encoder.receiver import (
     MMReceiverBase,
@@ -393,6 +393,67 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
         self.assertTrue(waiting_req.released)
         self.assertTrue(waiting_req.closed)
         self.assertEqual(len(abort_reqs), 1)
+
+
+class TestTokenizerReceiveTaskCleanup(unittest.IsolatedAsyncioTestCase):
+    async def _exercise(self, outcome):
+        started = [asyncio.Event(), asyncio.Event()]
+        finished = [asyncio.Event(), asyncio.Event()]
+        tasks = []
+        result = object()
+
+        async def worker(index):
+            tasks.append(asyncio.current_task())
+            started[index].set()
+            try:
+                if outcome == "success" and index == 1:
+                    await started[0].wait()
+                    return result
+                await asyncio.Event().wait()
+            finally:
+                finished[index].set()
+
+        # No Mooncake cleanup method: tokenizer receive owns ZMQ tasks/socket,
+        # while scheduler-side RDMA requests own their separate buffers.
+        receiver = SimpleNamespace(
+            encode_urls=["http://encoder"],
+            context=None,
+            host="127.0.0.1",
+            recv_timeout=0.05 if outcome == "timeout" else 10,
+            _extract_url_data=lambda request: [],
+            encode=lambda *args, **kwargs: worker(0),
+            _recv_mm_data=lambda *args: worker(1),
+        )
+        socket = Mock()
+        with patch(
+            "sglang.srt.disaggregation.encoder.receiver.get_zmq_socket_on_host",
+            return_value=(12345, socket),
+        ):
+            request = asyncio.create_task(
+                MMReceiverBase.recv_mm_data(receiver, object(), None, "prompt")
+            )
+            await asyncio.wait_for(asyncio.gather(*(e.wait() for e in started)), 1)
+            if outcome == "cancel":
+                request.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await request
+            else:
+                self.assertIs(
+                    await asyncio.wait_for(request, 1),
+                    result if outcome == "success" else None,
+                )
+        self.assertTrue(all(task.done() for task in tasks))
+        self.assertTrue(all(event.is_set() for event in finished))
+        socket.close.assert_called_once_with(linger=0)
+
+    async def test_cancel_drains_both_tasks_and_closes_socket(self):
+        await self._exercise("cancel")
+
+    async def test_timeout_drains_both_tasks_and_closes_socket(self):
+        await self._exercise("timeout")
+
+    async def test_success_drains_pending_encoder_and_closes_socket(self):
+        await self._exercise("success")
 
 
 if __name__ == "__main__":

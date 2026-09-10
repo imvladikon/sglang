@@ -222,6 +222,18 @@ def is_qwen4_exp(config) -> bool:
 def resolve_spec_hidden_size(
     hf_config, hidden_size: int, hc_mult: int
 ) -> tuple[int, Optional[int]]:
+    text_config = _hf_attr(hf_config, "text_config") or hf_config
+    is_glm5_next = _hf_attr(hf_config, "model_type") == "glm5_next" or (
+        _hf_attr(text_config, "model_type") == "glm5_next_text"
+    )
+    if is_glm5_next:
+        # GLM-5.3 carries an mHC residual stream internally, but contracts it
+        # before the target-to-draft boundary. Published non-mHC checkpoints
+        # may still retain hc_mult, so do not allocate a widened stream.
+        if hc_mult <= 1 or not _hf_attr(text_config, "mhc"):
+            return hidden_size, None
+        return hidden_size, hidden_size * hc_mult
+
     # DSV4 and Qwen4-Exp carry the hc-flattened stream across the target->draft
     # boundary; other hc models (hy_v4) collapse to hidden_size first.
     if hc_mult <= 1 or not (is_deepseek_v4(hf_config) or is_qwen4_exp(hf_config)):
@@ -335,7 +347,7 @@ def get_dsa_mtp_topk_width(config: PretrainedConfig) -> int:
     """MTP seeds include index_topk pooled tokens plus up to index_kpool - 1 tail tokens."""
     index_kpool = get_dsa_index_kpool(config)
     assert index_kpool >= 1, f"index_kpool must be positive, got {index_kpool}"
-    return config.index_topk + index_kpool - 1
+    return get_dsa_index_topk(config) + index_kpool - 1
 
 
 def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:

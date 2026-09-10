@@ -1,10 +1,9 @@
 """Unit tests for srt/layers/quantization/fp8.py MoE runner ownership.
 
-`--moe-runner-backend flashinfer_trtllm[_routed]` is a global setting, so
-`Fp8MoEMethod.process_weights_after_loading` must also require that this
-instance owns a MoeRunner before materializing the TRT-LLM SwiGLU params:
-the MxFP4 wrapper methods borrow an `Fp8MoEMethod` for weight loading only
-and never give it a `moe_runner_config` (issue #36264).
+MoE backend flags are global, so `Fp8MoEMethod.process_weights_after_loading`
+must require that this instance owns a MoeRunner before materializing
+backend-specific parameters or layouts. MxFP4 wrappers borrow an `Fp8MoEMethod`
+for weight loading without giving it a runner (issue #36264).
 """
 
 import unittest
@@ -34,6 +33,12 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         hip_int4 = patch("sglang.srt.layers.quantization.fp8._use_hip_int4", False)
         hip_int4.start()
         self.addCleanup(hip_int4.stop)
+        auto_marlin = patch(
+            "sglang.srt.layers.quantization.fp8.can_auto_enable_marlin_fp8",
+            return_value=False,
+        )
+        auto_marlin.start()
+        self.addCleanup(auto_marlin.stop)
 
     def tearDown(self):
         get_flags().moe.runner_backend = self._saved_runner_backend
@@ -112,6 +117,120 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         self._run_post_load(method=method, layer=layer)
 
         self._assert_activation_params_absent(layer)
+
+    def test_ampere_fp8_moe_overrides_triton_with_marlin(self):
+        get_flags().moe.runner_backend = MoeRunnerBackend.TRITON
+        with (
+            patch("sglang.srt.layers.quantization.fp8._is_cuda", True),
+            patch(
+                "sglang.srt.layers.quantization.fp8.can_auto_enable_marlin_fp8",
+                return_value=True,
+            ),
+            patch("sglang.srt.layers.quantization.fp8.MoeRunner") as runner_cls,
+        ):
+            runner_cls.side_effect = lambda backend, _config: SimpleNamespace(
+                runner_backend=backend
+            )
+            method = self._make_block_fp8_method()
+            method.create_moe_runner(
+                layer=self._make_layer(), moe_runner_config=MoeRunnerConfig()
+            )
+
+        self.assertTrue(method.use_marlin)
+        self.assertEqual(method.runner.runner_backend, MoeRunnerBackend.MARLIN)
+        self.assertTrue(method._owns_moe_runner)
+
+    def test_ampere_block_fp8_moe_uses_marlin_post_process(self):
+        method = self._make_block_fp8_method()
+        method.use_marlin = True
+        layer = self._make_layer()
+        with patch(
+            "sglang.srt.layers.quantization.fp8.prepare_moe_fp8_layer_for_marlin"
+        ) as prepare:
+            method.process_weights_after_loading_block_quant(layer)
+
+        self.assertEqual(layer.weight_block_size, [128, 128])
+        prepare.assert_called_once_with(layer, size_k_first=False)
+
+    def test_global_aiter_does_not_shuffle_triton_runner_weights(self):
+        """SGLANG_USE_AITER also enables non-MoE kernels, so the selected MoE
+        runner must own the preshuffled layout before weights are rewritten."""
+        method = self._make_block_fp8_method()
+        method.convert_mxfp8_to_block = True
+        method.use_mxfp8 = True
+        method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
+        method._owns_moe_runner = True
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(torch.arange(16.0).reshape(1, 4, 4)),
+            w2_weight=torch.nn.Parameter(torch.arange(16.0).reshape(1, 4, 4)),
+        )
+
+        with (
+            patch("sglang.srt.layers.quantization.fp8._use_aiter", True),
+            patch("sglang.srt.layers.quantization.fp8._is_fp8_fnuz", False),
+            patch.object(method, "_convert_mxfp8_moe_to_block_fp8"),
+            patch(
+                "sglang.srt.layers.quantization.fp8.shuffle_weight", create=True
+            ) as shuffle,
+        ):
+            method.process_weights_after_loading_block_quant(layer)
+
+        shuffle.assert_not_called()
+
+    def test_borrowed_delegate_skips_aiter_weight_shuffle(self):
+        """MxFP4 delegates do not own a runner, so global AITER enablement must
+        not make weight loading dereference or prepare an absent runner."""
+        method = self._make_block_fp8_method()
+        method.convert_mxfp8_to_block = True
+        method.use_mxfp8 = True
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(torch.arange(16.0).reshape(1, 4, 4)),
+            w2_weight=torch.nn.Parameter(torch.arange(16.0).reshape(1, 4, 4)),
+        )
+
+        with (
+            patch("sglang.srt.layers.quantization.fp8._use_aiter", True),
+            patch("sglang.srt.layers.quantization.fp8._is_fp8_fnuz", False),
+            patch.object(method, "_convert_mxfp8_moe_to_block_fp8"),
+            patch(
+                "sglang.srt.layers.quantization.fp8.shuffle_weight", create=True
+            ) as shuffle,
+        ):
+            method.process_weights_after_loading_block_quant(layer)
+
+        shuffle.assert_not_called()
+
+    def test_aiter_runner_keeps_preshuffled_weight_layout(self):
+        method = self._make_block_fp8_method()
+        method.convert_mxfp8_to_block = True
+        method.use_mxfp8 = True
+        method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.AITER)
+        method._owns_moe_runner = True
+        original_w13 = torch.arange(16.0).reshape(1, 4, 4)
+        original_w2 = torch.arange(16.0, 32.0).reshape(1, 4, 4)
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(original_w13.clone()),
+            w2_weight=torch.nn.Parameter(original_w2.clone()),
+        )
+
+        def add_one(weight, _tile):
+            return weight + 1
+
+        with (
+            patch("sglang.srt.layers.quantization.fp8._use_aiter", True),
+            patch("sglang.srt.layers.quantization.fp8._is_fp8_fnuz", False),
+            patch.object(method, "_convert_mxfp8_moe_to_block_fp8"),
+            patch(
+                "sglang.srt.layers.quantization.fp8.shuffle_weight",
+                side_effect=add_one,
+                create=True,
+            ) as shuffle,
+        ):
+            method.process_weights_after_loading_block_quant(layer)
+
+        self.assertEqual(shuffle.call_count, 2)
+        torch.testing.assert_close(layer.w13_weight, original_w13 + 1)
+        torch.testing.assert_close(layer.w2_weight, original_w2 + 1)
 
 
 if __name__ == "__main__":

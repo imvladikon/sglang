@@ -47,6 +47,9 @@ _validate_mamba_replay_state_indices = (
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # Recurrent backends must explicitly opt in after their graph metadata
+    # loader is proven independent of live conv/SSM state.
+    supports_overlap_plan_stream_graph_load: bool = False
     supports_mis: bool = False
 
     @classmethod
@@ -1075,6 +1078,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
+    supports_overlap_plan_stream_graph_load: bool = False
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
@@ -1096,6 +1101,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
+        self.supports_overlap_plan_stream_graph_load = bool(
+            linear_attn_backend.supports_overlap_plan_stream_graph_load
+        )
 
     @property
     def data_type(self):

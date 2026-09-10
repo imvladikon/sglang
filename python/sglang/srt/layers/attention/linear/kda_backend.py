@@ -258,14 +258,10 @@ class KDAKernelDispatcher:
         lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if lower_bound is not None and not isinstance(
-            self.decode_kernel, TritonKDAKernel
-        ):
-            raise NotImplementedError(
-                f"lower_bound (safe gate) is only supported by TritonKDAKernel; "
-                f"got {self.decode_kernel.__class__.__name__}."
-            )
-        return self.decode_kernel.decode(
+        kernel = self.decode_kernel
+        if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
+            kernel = self.triton_kernel
+        return kernel.decode(
             q,
             k,
             v,
@@ -928,6 +924,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata,
                 h_track_buf=h_track_buf,
             )
+
+        if (
+            self.accept_lens_pool is not None
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # Fused-accept staging: the extend kernel just wrote this request's
+            # committed state; copy it into scratch slot 0 and reset the accept
+            # length to 1 so the first verify reads slot 0. Runs once per KDA
+            # layer (the nat write is idempotent; the scratch copy is per-layer).
+            slots = cache_indices.to(torch.int64)
+            intermediate_ssm = mamba_cache_params.intermediate_ssm
+            intermediate_ssm[slots, 0] = ssm_states[slots].to(intermediate_ssm.dtype)
+            self.accept_lens_pool[slots] = 1
 
         if logical_num_tokens < physical_num_tokens:
             pad = core_attn_out.new_zeros(

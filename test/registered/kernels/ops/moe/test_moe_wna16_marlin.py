@@ -9,9 +9,20 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    prepare_moe_fp8_layer_for_marlin,
+)
+from sglang.srt.model_loader.marlin_reload import (
+    begin_marlin_reload,
+    finalize_marlin_reload,
+    finalize_marlin_reload_metadata,
+    record_marlin_reload_metadata,
+)
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
@@ -409,6 +420,197 @@ def test_fused_marlin_moe_non_gated_relu2():
 
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.04)
+
+
+@pytest.mark.skipif(
+    not is_sm80_supported(),
+    reason="FP8 Marlin MoE fallback requires CUDA SM8X or newer",
+)
+def test_fused_marlin_moe_block_fp8_matches_dequant_reference():
+    """Exercise the checkpoint layout used by GLM routed experts on Ampere."""
+    torch.manual_seed(0)
+
+    m = 17
+    hidden_size = 256
+    intermediate_size = 256
+    experts = 4
+    topk = 2
+    dtype = torch.bfloat16
+    block_n = block_k = 128
+
+    def block_quantize(weight):
+        e, n, k = weight.shape
+        tiles = (
+            weight.float()
+            .reshape(e, n // block_n, block_n, k // block_k, block_k)
+            .permute(0, 1, 3, 2, 4)
+        )
+        scales = tiles.abs().amax(dim=(-2, -1)).clamp_min(1e-6) / 448.0
+        quant = (tiles / scales[..., None, None]).to(torch.float8_e4m3fn)
+        quant = quant.permute(0, 1, 3, 2, 4).reshape(e, n, k)
+        dequant = (
+            quant.float()
+            .reshape(e, n // block_n, block_n, k // block_k, block_k)
+            .permute(0, 1, 3, 2, 4)
+            * scales[..., None, None]
+        )
+        dequant = dequant.permute(0, 1, 3, 2, 4).reshape(e, n, k)
+        return quant, scales, dequant.to(dtype)
+
+    w13_source = (
+        torch.randn(
+            experts, 2 * intermediate_size, hidden_size, device="cuda", dtype=dtype
+        )
+        / 20
+    )
+    w2_source = (
+        torch.randn(experts, hidden_size, intermediate_size, device="cuda", dtype=dtype)
+        / 20
+    )
+    w13_quant, w13_scales, w13_ref = block_quantize(w13_source)
+    w2_quant, w2_scales, w2_ref = block_quantize(w2_source)
+
+    layer = SimpleNamespace(
+        num_experts=experts,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=intermediate_size,
+        orig_dtype=dtype,
+        weight_block_size=[block_n, block_k],
+        w13_weight=torch.nn.Parameter(w13_quant, requires_grad=False),
+        w2_weight=torch.nn.Parameter(w2_quant, requires_grad=False),
+        w13_weight_scale_inv=torch.nn.Parameter(w13_scales, requires_grad=False),
+        w2_weight_scale_inv=torch.nn.Parameter(w2_scales, requires_grad=False),
+    )
+    prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
+
+    hidden_states = torch.randn(m, hidden_size, device="cuda", dtype=dtype) / 10
+    router_logits = torch.randn(m, experts, device="cuda", dtype=dtype)
+    routing = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    topk_weights, topk_ids = torch.topk(routing, topk)
+
+    output = fused_marlin_moe(
+        hidden_states=hidden_states,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        gating_output=router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        num_bits=8,
+        is_fp8=True,
+        routed_scaling_factor=1.0,
+        activation="silu",
+        is_gated=True,
+    )
+
+    output_ref = torch.zeros_like(hidden_states, dtype=torch.float32)
+    for token_idx in range(m):
+        for route_idx in range(topk):
+            expert_id = topk_ids[token_idx, route_idx]
+            gate_up = hidden_states[token_idx] @ w13_ref[expert_id].T
+            gate, up = gate_up.chunk(2)
+            intermediate = torch.nn.functional.silu(gate) * up
+            routed = intermediate @ w2_ref[expert_id].T
+            output_ref[token_idx] += routed.float() * topk_weights[token_idx, route_idx]
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, output_ref.to(dtype), rtol=0.04, atol=0.04)
+
+
+@pytest.mark.skipif(
+    not is_sm80_supported(),
+    reason="FP8 Marlin MoE reload requires CUDA SM8X or newer",
+)
+def test_fp8_moe_marlin_hot_reload_matches_cold_repack():
+    """RL sync must replay model-format weights without moving graph buffers."""
+    torch.manual_seed(1)
+    experts = 2
+    hidden_size = 128
+    intermediate_size = 128
+
+    def checkpoint(seed):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        w13 = (
+            torch.randn(
+                experts,
+                2 * intermediate_size,
+                hidden_size,
+                device="cuda",
+                generator=generator,
+            )
+            / 20
+        ).to(torch.float8_e4m3fn)
+        w2 = (
+            torch.randn(
+                experts,
+                hidden_size,
+                intermediate_size,
+                device="cuda",
+                generator=generator,
+            )
+            / 20
+        ).to(torch.float8_e4m3fn)
+        return {
+            "w13_weight": w13,
+            "w2_weight": w2,
+            "w13_weight_scale_inv": torch.rand(
+                experts, 2, 1, device="cuda", generator=generator
+            ).clamp_min_(1e-3),
+            "w2_weight_scale_inv": torch.rand(
+                experts, 1, 1, device="cuda", generator=generator
+            ).clamp_min_(1e-3),
+        }
+
+    def make_layer(values):
+        layer = torch.nn.Module()
+        layer.num_experts = experts
+        layer.num_local_experts = experts
+        layer.hidden_size = hidden_size
+        layer.intermediate_size_per_partition = intermediate_size
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+        layer.quant_method = Fp8MoEMethod(
+            Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                weight_block_size=[128, 128],
+            )
+        )
+        assert layer.quant_method.use_marlin
+        for name, value in values.items():
+            param = torch.nn.Parameter(value.clone(), requires_grad=False)
+            param.weight_loader = default_weight_loader
+            layer.register_parameter(name, param)
+        layer.orig_dtype = torch.bfloat16
+        return layer
+
+    initial = checkpoint(1)
+    updated = checkpoint(2)
+
+    layer = make_layer(initial)
+    record_marlin_reload_metadata(layer, torch.device("cuda"))
+    layer.quant_method.process_weights_after_loading(layer)
+    finalize_marlin_reload_metadata(layer)
+    live_ptrs = {
+        name: getattr(layer, name).data_ptr()
+        for name in (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        )
+    }
+
+    assert begin_marlin_reload(layer)
+    for name, value in updated.items():
+        param = getattr(layer, name)
+        param.weight_loader(param, value)
+    finalize_marlin_reload(layer)
+
+    cold = make_layer(updated)
+    cold.quant_method.process_weights_after_loading(cold)
+    for name, old_ptr in live_ptrs.items():
+        assert getattr(layer, name).data_ptr() == old_ptr
+        torch.testing.assert_close(getattr(layer, name), getattr(cold, name))
 
 
 @pytest.mark.parametrize("m", [123, 2304])

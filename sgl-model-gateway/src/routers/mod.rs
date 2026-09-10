@@ -1,6 +1,7 @@
 //! Router implementations
 
 use std::fmt::Debug;
+use std::ops::Deref;
 
 use async_trait::async_trait;
 use axum::{
@@ -13,12 +14,48 @@ use axum::{
 use crate::protocols::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
+    common::GenerationRequest,
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     rerank::RerankRequest,
     responses::{ResponsesGetParams, ResponsesRequest},
 };
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// SGLang's native `/generate` endpoint evolves faster than the typed gateway
+/// protocol. Preserve engine-specific fields while retaining the typed core
+/// used for routing decisions.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenerateRequestWithExtensions {
+    #[serde(flatten)]
+    pub request: GenerateRequest,
+    #[serde(flatten)]
+    pub extensions: Map<String, Value>,
+}
+
+impl Deref for GenerateRequestWithExtensions {
+    type Target = GenerateRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+impl GenerationRequest for GenerateRequestWithExtensions {
+    fn is_stream(&self) -> bool {
+        self.request.is_stream()
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        self.request.get_model()
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        self.request.extract_text_for_routing()
+    }
+}
 
 pub mod conversations;
 pub mod error;
@@ -80,7 +117,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &GenerateRequest,
+        _body: &GenerateRequestWithExtensions,
         _model_id: Option<&str>,
     ) -> Response {
         (
@@ -203,5 +240,37 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Check if this is a PD router
     fn is_pd_mode(&self) -> bool {
         self.router_type() == "pd"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GenerateRequestWithExtensions;
+    use serde_json::json;
+
+    #[test]
+    fn native_generate_extensions_survive_a_typed_round_trip() {
+        let input = json!({
+            "text": "hello",
+            "return_logprob": true,
+            "return_routed_experts": true,
+            "routed_experts_start_len": 3,
+            "return_indexer_topk": true
+        });
+
+        let request: GenerateRequestWithExtensions =
+            serde_json::from_value(input).expect("deserialize native generate request");
+
+        assert_eq!(request.request.text.as_deref(), Some("hello"));
+        assert_eq!(request.request.return_logprob, Some(true));
+        assert_eq!(request.extensions["return_routed_experts"], json!(true));
+        assert_eq!(request.extensions["routed_experts_start_len"], json!(3));
+        assert_eq!(request.extensions["return_indexer_topk"], json!(true));
+        assert!(!request.extensions.contains_key("return_logprob"));
+
+        let output = serde_json::to_value(request).expect("serialize native generate request");
+        assert_eq!(output["return_routed_experts"], json!(true));
+        assert_eq!(output["routed_experts_start_len"], json!(3));
+        assert_eq!(output["return_indexer_topk"], json!(true));
     }
 }

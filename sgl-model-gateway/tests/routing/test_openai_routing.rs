@@ -27,7 +27,7 @@ use smg::{
         generate::GenerateRequest,
         responses::{ResponseInput, ResponsesGetParams, ResponsesRequest},
     },
-    routers::{openai::OpenAIRouter, RouterTrait},
+    routers::{openai::OpenAIRouter, GenerateRequestWithExtensions, RouterTrait},
 };
 use tokio::{
     net::TcpListener,
@@ -635,6 +635,10 @@ async fn test_unsupported_endpoints() {
         rid: None,
     };
 
+    let generate_request = GenerateRequestWithExtensions {
+        request: generate_request,
+        extensions: Default::default(),
+    };
     let response = router.route_generate(None, &generate_request, None).await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 

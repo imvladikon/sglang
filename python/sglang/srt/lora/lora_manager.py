@@ -781,11 +781,10 @@ class LoRAManager:
         # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
         indexer_targets = self.target_modules & DSA_INDEXER_LORA_NAMES
         if indexer_targets:
-            from sglang.srt.layers.attention.dsa.dsa_indexer import (
-                _use_dsa_indexer_fusion,
-            )
-
-            if _use_dsa_indexer_fusion:
+            if any(
+                getattr(module, "use_dsa_indexer_fusion", False)
+                for module in self.base_model.modules()
+            ):
                 raise ValueError(
                     f"LoRA targets the DSA indexer ({sorted(indexer_targets)}), which is "
                     "incompatible with DSA indexer Q/K fusion. Set "

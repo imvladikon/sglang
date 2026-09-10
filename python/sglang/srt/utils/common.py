@@ -3425,7 +3425,8 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+if not hasattr(triton, "next_power_of_2"):
+    triton.next_power_of_2 = next_power_of_2
 
 
 class EmptyContextManager:
@@ -4457,6 +4458,12 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # Inkling attention projections (merged q/k/v/r and its row-parallel output).
     "qkvr",
     "wo_ud",
+    # GLM-5.3-Flash KDA gate projections.
+    "b_proj",
+    "f_a_proj",
+    "f_b_proj",
+    "g_a_proj",
+    "g_b_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

@@ -78,6 +78,16 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
     return get_dsa_mtp_topk_width(hf_config)
 
 
+def should_bypass_dsa_cp_prefix_cache(server_args, *, is_dsa: bool) -> bool:
+    """Avoid non-local prefix-cache rows until PD supports CP-aware resharding."""
+    return (
+        is_dsa
+        and server_args.disaggregation_mode == "prefill"
+        and server_args.attn_cp_size > 1
+        and server_args.enable_prefill_cp
+    )
+
+
 def is_dsv4_c128_online_enabled() -> bool:
     """Return whether DSV4 C128 uses request-scoped online state."""
     return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()

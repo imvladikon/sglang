@@ -61,6 +61,9 @@ class TorchMemorySaverAdapter(ABC):
     def configure_subprocess(self):
         raise NotImplementedError
 
+    def configure_current_process(self):
+        raise NotImplementedError
+
     def region(self, tag: str, enable_cpu_backup: bool = False):
         raise NotImplementedError
 
@@ -96,6 +99,13 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
             # upstream setup.py does not build for XPU.
             return self._noop_context()
         return torch_memory_saver.configure_subprocess()
+
+    def configure_current_process(self):
+        # This process was spawned under configure_subprocess(), so the preload
+        # hook is active. Reset the public TMS mode before the first allocator
+        # use: co-located trainer imports (notably Megatron) may have changed
+        # the inherited singleton to hook_mode="torch" in the parent process.
+        _memory_saver.hook_mode = "preload"
 
     def region(self, tag: str, enable_cpu_backup: bool = False):
         return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
@@ -140,6 +150,9 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
     @contextmanager
     def configure_subprocess(self):
         yield
+
+    def configure_current_process(self):
+        pass
 
     @contextmanager
     def region(self, tag: str, enable_cpu_backup: bool = False):

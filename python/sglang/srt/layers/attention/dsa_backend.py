@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import logging
 from dataclasses import dataclass
 from typing import (
@@ -23,7 +25,6 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 
-logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
@@ -50,9 +51,8 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
-    get_dsa_index_topk,
-    is_deepseek_dsa,
 )
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
@@ -88,7 +88,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -97,6 +96,7 @@ from sglang.srt.utils import (
     is_xpu,
     print_warning_once,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +296,7 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
+    "torch",
     "flashmla_sparse",
     "flashmla_sparse_q8",
     "flashmla_kv",
@@ -783,6 +784,7 @@ class DeepseekSparseAttnBackend(
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
             self.dsa_topk_backend.is_sgl_kernel()
+            or self.dsa_topk_backend.is_torch()
             or self.dsa_topk_backend.is_flashinfer()
         ):
             return topk_indices
@@ -1092,10 +1094,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and not self._skip_short_torch_indexer_schedule(forward_batch)
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -1229,6 +1235,16 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx = split_per_token(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
+    def _cuda_graph_memory_region(self):
+        """Return the TMS region released for CUDA-graph-only metadata."""
+        adapter = TorchMemorySaverAdapter.create(
+            enable=get_exec().features.enable_memory_saver
+            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        )
+        if not adapter.enabled:
+            return nullcontext()
+        return adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -1266,6 +1282,32 @@ class DeepseekSparseAttnBackend(
         )
 
         max_ctx_len = self.req_to_token.shape[1]
+        # These buffers are rewritten in full before each replay and can be
+        # safely released with the CUDA-graph region while the rollout engine
+        # is paused. Other metadata below is initialized once and must retain
+        # its contents, so it deliberately stays outside this region.
+        with self._cuda_graph_memory_region():
+            page_table = (
+                None
+                if self.dsa_drop_wide_page_table
+                else torch.zeros(
+                    max_num_tokens,
+                    max_ctx_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            flashmla_metadata = (
+                self._compute_flashmla_metadata(
+                    cache_seqlens=torch.ones(
+                        max_num_tokens, dtype=torch.int32, device=self.device
+                    ),
+                    seq_len_q=1,
+                )
+                if self.dsa_decode_impl == "flashmla_kv"
+                else None
+            )
+
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1292,26 +1334,8 @@ class DeepseekSparseAttnBackend(
                 if self.dsa_drop_wide_page_table
                 else None
             ),
-            "page_table": (
-                None
-                if self.dsa_drop_wide_page_table
-                else torch.zeros(
-                    max_num_tokens,
-                    max_ctx_len,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            ),
-            "flashmla_metadata": (
-                self._compute_flashmla_metadata(
-                    cache_seqlens=torch.ones(
-                        max_num_tokens, dtype=torch.int32, device=self.device
-                    ),
-                    seq_len_q=1,
-                )
-                if self.dsa_decode_impl == "flashmla_kv"
-                else None
-            ),
+            "page_table": page_table,
+            "flashmla_metadata": flashmla_metadata,
         }
 
     def _build_forward_metadata_cuda_graph(
@@ -2007,6 +2031,9 @@ class DeepseekSparseAttnBackend(
             else "prefill"
         )
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
+        topk_indices = self._trim_empty_kpool_tail_for_torch_fallback(
+            topk_indices, dsa_impl, forward_batch
+        )
         self._check_kpool_tail_backend(topk_indices, dsa_impl, phase)
 
         if dsa_impl == "trtllm" and not self.use_mha:
@@ -2121,7 +2148,17 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
-        if dsa_impl == "tilelang":
+        if dsa_impl == "torch":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_torch_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif dsa_impl == "tilelang":
             if q_rope is not None:
                 # Triton prefill kernel reads q_nope/q_rope directly, skipping
                 # the concat (it splits q into main/tail internally anyway).
@@ -2328,6 +2365,9 @@ class DeepseekSparseAttnBackend(
         assert causal, "DSA is causal only"
 
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
+        topk_indices = self._trim_empty_kpool_tail_for_torch_fallback(
+            topk_indices, dsa_impl, forward_batch
+        )
         self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
 
         if attn_sink is not None and dsa_impl != "flashmla_sparse":
@@ -2407,7 +2447,17 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
-        if dsa_impl == "flashmla_sparse":
+        if dsa_impl == "torch":
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_torch_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
@@ -2955,6 +3005,45 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
+
+    @staticmethod
+    def _forward_torch_sparse_mla(
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        """Exact eager sparse-MLA reference for compact development models."""
+        if page_table_1.ndim != 2 or page_table_1.shape[0] != q_all.shape[0]:
+            raise ValueError(
+                "Torch DSA expects one sparse index row per query token, got "
+                f"q={tuple(q_all.shape)} and indices={tuple(page_table_1.shape)}."
+            )
+
+        flat_kv = kv_cache.reshape(-1, kv_cache.shape[-1])
+        valid = page_table_1 >= 0
+        if not torch.all(valid.any(dim=-1)):
+            raise ValueError("Torch DSA received a query with no valid KV indices.")
+        safe_indices = torch.where(
+            valid, page_table_1, torch.zeros_like(page_table_1)
+        ).to(torch.long)
+        if torch.any(safe_indices >= flat_kv.shape[0]):
+            raise IndexError(
+                "Torch DSA sparse index exceeds the flattened KV cache capacity."
+            )
+
+        selected_kv = flat_kv.index_select(0, safe_indices.reshape(-1)).view(
+            *safe_indices.shape, flat_kv.shape[-1]
+        )
+        q_float = q_all.float()
+        k_float = selected_kv.float()
+        scores = torch.einsum("thd,tkd->thk", q_float, k_float) * sm_scale
+        scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        values = k_float[..., :v_head_dim]
+        output = torch.einsum("thk,tkd->thd", probs, values)
+        return output.to(q_all.dtype)
 
     def _forward_flashmla_kv(
         self,

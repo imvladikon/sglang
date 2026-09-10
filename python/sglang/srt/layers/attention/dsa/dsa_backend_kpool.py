@@ -41,7 +41,8 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or topk_indices.shape[-1] <= self.dsa_index_topk
+            or dsa_impl in ("torch", "fa3", "tilelang", "trtllm")
         ):
             return
         raise NotImplementedError(
@@ -49,6 +50,43 @@ class DeepseekSparseAttnBackendKPoolMixin:
             f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
             "backend."
         )
+
+    def _trim_empty_kpool_tail_for_torch_fallback(
+        self,
+        topk_indices: Optional[torch.Tensor],
+        dsa_impl: _DSA_IMPL_T,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        """Drop placeholder tail slots from the eager short-context path.
+
+        KPool's exact select-all path already includes every live token in the
+        regular ``index_topk`` columns and appends ``index_kpool - 1`` values of
+        ``-1`` only to preserve the production kernel shape.  Backends without
+        KPool-tail support can therefore consume the regular columns exactly,
+        but only while the whole live context fits inside ``index_topk``.
+        """
+        if (
+            topk_indices is None
+            or self.dsa_index_kpool <= 1
+            or dsa_impl in ("torch", "fa3", "tilelang", "trtllm")
+            or not self.dsa_topk_backend.is_torch()
+            or not (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                or forward_batch.forward_mode.is_decode_or_idle()
+            )
+        ):
+            return topk_indices
+
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        expected_width = self.dsa_index_topk + self.dsa_index_kpool - 1
+        if (
+            seq_lens_cpu is not None
+            and seq_lens_cpu.numel() > 0
+            and int(seq_lens_cpu.max().item()) <= self.dsa_index_topk
+            and topk_indices.shape[-1] == expected_width
+        ):
+            return topk_indices[..., : self.dsa_index_topk]
+        return topk_indices
 
     def _resolve_kpool_tail_backend(
         self,
@@ -75,6 +113,26 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return self.num_q_heads in (32, 64)
         return True
 
+    def _skip_short_torch_indexer_schedule(self, forward_batch: ForwardBatch) -> bool:
+        """Whether Torch DSA can skip the production DeepGEMM schedule."""
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if not self.dsa_topk_backend.is_torch() or self.dsa_index_kpool <= 1:
+            return False
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and self.dsa_prefill_impl == "torch"
+        ):
+            return True
+        if forward_batch.forward_mode.is_decode_or_idle():
+            if self.dsa_decode_impl == "torch":
+                return True
+            return (
+                seq_lens_cpu is not None
+                and seq_lens_cpu.numel() > 0
+                and int(seq_lens_cpu.max().item()) <= self.dsa_index_topk
+            )
+        return False
+
     def _init_kpool_metadata(
         self,
         metadata: DSAMetadata,
@@ -87,7 +145,10 @@ class DeepseekSparseAttnBackendKPoolMixin:
 
         forward_mode = forward_batch.forward_mode
         slots_per_page = self._kpool_slots_per_page()
-        build_schedule_metadata = self._build_kpool_paged_mqa_schedule_metadata()
+        build_schedule_metadata = (
+            self._build_kpool_paged_mqa_schedule_metadata()
+            and not self._skip_short_torch_indexer_schedule(forward_batch)
+        )
         if forward_mode.is_extend_without_speculative():
             assert topk_transform_method is not None
             assert kpool_inputs is not None
