@@ -50,6 +50,16 @@ class MambaAttnBackendBase(AttentionBackend):
     # Recurrent backends must explicitly opt in after their graph metadata
     # loader is proven independent of live conv/SSM state.
     supports_overlap_plan_stream_graph_load: bool = False
+    supports_mis: bool = False
+
+    @classmethod
+    def validate_mis_support(cls, server_args) -> None:
+        if server_args.enable_mis and not cls.supports_mis:
+            raise ValueError(
+                f"{cls.__name__} does not support multi-item scoring. "
+                "Hybrid models require a linear-attention backend that explicitly "
+                "declares MIS support."
+            )
 
     # Per-slot accept lengths for the KDA fused-accept spec path; allocated only
     # by KDAAttnBackend where `_can_fuse_accept_state` holds. None everywhere
@@ -57,6 +67,7 @@ class MambaAttnBackendBase(AttentionBackend):
     accept_lens_pool: Optional[torch.Tensor] = None
 
     def __init__(self, model_runner: ModelRunner):
+        self.validate_mis_support(model_runner.server_args)
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
