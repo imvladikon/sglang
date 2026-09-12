@@ -49,7 +49,6 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_parallel,
-    get_server_args,
 )
 
 if TYPE_CHECKING:
@@ -119,7 +118,14 @@ class IndexerKPool(MultiPlatformOp):
             self.compress_gate_stream = torch.cuda.Stream()
 
         if is_cuda():
-            self.sm_count = deep_gemm.get_num_sms()
+            # The Torch reference path does not use DeepGEMM. Querying its
+            # runtime here would initialize an unused optional CUDA backend.
+            if get_exec().kernel.dsa_paged_mqa_logits_backend == "torch":
+                self.sm_count = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+            else:
+                self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
         # Lazy, non-checkpointed raw state used only by the eager Torch

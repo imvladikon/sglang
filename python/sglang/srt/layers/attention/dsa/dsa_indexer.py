@@ -278,7 +278,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         else:
             self.cp_size = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            # Keep DeepGEMM's configured SM budget on its own path; the Torch
+            # reference backend must not initialize that optional runtime.
+            if self.paged_mqa_logits_backend.is_torch():
+                self.sm_count = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+            else:
+                self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_parallel().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
