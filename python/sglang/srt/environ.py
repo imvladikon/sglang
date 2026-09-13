@@ -1544,8 +1544,8 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
-    # Later draft steps reuse step-0 metadata instead of recomputing it.
-    SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(False)
+    # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
+    SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     # Capture the verify metadata refresh inside the CUDA graph; the
     # DG_OUT_OF_GRAPH sub-mode keeps DeepGEMM scheduling out of the graph.
     SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA = EnvBool(False)
