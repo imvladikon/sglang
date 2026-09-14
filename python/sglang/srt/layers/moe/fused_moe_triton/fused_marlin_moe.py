@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
@@ -135,6 +136,31 @@ def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
 
 
+def _canonicalize_marlin_token_order(
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    block_size: int,
+    numel: int,
+) -> torch.Tensor:
+    """Give each expert a fixed pair-index order, preserving its block padding.
+
+    The alignment kernel's atomic scatter can change a token's GEMM tile/lane
+    between calls. Even FP32 reduction can then round to different BF16 values.
+    Keep all sizes static and the padded length on device for CUDA graphs.
+    """
+    offsets = torch.arange(sorted_token_ids.numel(), device=sorted_token_ids.device)
+    radix = numel + 1  # Padding uses pair index numel.
+    keys = (expert_ids[offsets // block_size].to(torch.int64) + 1) * radix
+    keys = keys + sorted_token_ids
+    # The allocation tail has no defined expert id or token id. Exclude it
+    # before sorting, including when its uninitialized contents are negative.
+    keys.masked_fill_(offsets >= num_tokens_post_padded, torch.iinfo(torch.int64).max)
+    return torch.where(
+        offsets < num_tokens_post_padded, keys.sort().values.remainder(radix), numel
+    ).to(torch.int32)
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -239,6 +265,7 @@ def fused_marlin_moe(
     N = w2.shape[1] * 16
     topk = topk_ids.shape[1]
     gemm1_n = 2 * N if is_gated else N
+    deterministic = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     # M block size selection logic
     # TODO: tune this further for specific models
@@ -267,6 +294,14 @@ def fused_marlin_moe(
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, block_size_m, global_num_experts
         )
+        if deterministic:
+            sorted_token_ids = _canonicalize_marlin_token_order(
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                block_size_m,
+                topk_ids.numel(),
+            )
 
     if workspace is None:
         max_workspace_size = (max(2 * N, K) // 64) * (
@@ -303,9 +338,13 @@ def fused_marlin_moe(
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
     use_atomic_add = (
-        hidden_states.dtype == torch.half
-        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-    ) and (not is_mxfp4_marlin)
+        not deterministic
+        and (
+            hidden_states.dtype == torch.half
+            or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+        )
+        and (not is_mxfp4_marlin)
+    )
 
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,

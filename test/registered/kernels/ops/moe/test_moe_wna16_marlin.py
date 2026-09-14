@@ -1,3 +1,4 @@
+import importlib
 import itertools
 import sys
 from types import SimpleNamespace
@@ -426,7 +427,10 @@ def test_fused_marlin_moe_non_gated_relu2():
     not is_sm80_supported(),
     reason="FP8 Marlin MoE fallback requires CUDA SM8X or newer",
 )
-def test_fused_marlin_moe_block_fp8_matches_dequant_reference():
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_fused_marlin_moe_block_fp8_matches_dequant_reference(
+    monkeypatch, deterministic
+):
     """Exercise the checkpoint layout used by GLM routed experts on Ampere."""
     torch.manual_seed(0)
 
@@ -488,6 +492,46 @@ def test_fused_marlin_moe_block_fp8_matches_dequant_reference():
     routing = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
     topk_weights, topk_ids = torch.topk(routing, topk)
 
+    monkeypatch.setenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", str(int(deterministic)))
+    if deterministic:
+        align_module = importlib.import_module("sglang.srt.layers.moe.fused_moe_triton")
+        marlin_module = importlib.import_module(
+            "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe"
+        )
+        original_align = align_module.moe_align_block_size
+        original_gemm = marlin_module.moe_wna16_marlin_gemm
+        expected_order = []
+        gemm_calls = []
+
+        def reversed_alignment(*args, **kwargs):
+            tokens, expert_ids, total = original_align(*args, **kwargs)
+            block_size = args[1]
+            routes = topk_ids.flatten().tolist()
+            canonical, reversed_pairs = [], []
+            for expert in sorted(set(routes)):
+                pairs = [i for i, eid in enumerate(routes) if eid == expert]
+                pads = [len(routes)] * (-len(pairs) % block_size)
+                canonical.extend(pairs + pads)
+                reversed_pairs.extend(pairs[::-1] + pads)
+            assert len(canonical) == total.item()
+            expected_order[:] = canonical
+            tokens[: len(canonical)] = torch.tensor(
+                reversed_pairs, device="cuda", dtype=torch.int32
+            )
+            return tokens, expert_ids, total
+
+        def checked_gemm(*args, **kwargs):
+            # Check the actual inputs of both real CUDA GEMMs, so this test
+            # fails if deterministic mode stops canonicalizing the aligner.
+            assert args[10][: len(expected_order)].tolist() == expected_order
+            assert not kwargs["use_atomic_add"]
+            assert kwargs["use_fp32_reduce"]
+            gemm_calls.append(1)
+            return original_gemm(*args, **kwargs)
+
+        monkeypatch.setattr(align_module, "moe_align_block_size", reversed_alignment)
+        monkeypatch.setattr(marlin_module, "moe_wna16_marlin_gemm", checked_gemm)
+
     output = fused_marlin_moe(
         hidden_states=hidden_states,
         w1=layer.w13_weight,
@@ -516,6 +560,8 @@ def test_fused_marlin_moe_block_fp8_matches_dequant_reference():
 
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref.to(dtype), rtol=0.04, atol=0.04)
+    if deterministic:
+        assert len(gemm_calls) == 2
 
 
 @pytest.mark.skipif(
