@@ -1566,6 +1566,12 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
+    # Allow an explicitly requested torch DSA backend (prefill/decode/top-k/MQA logits) on SM90+ CUDA.
+    # It is the eager reference path (per-layer host syncs, no fused kernels) and is rejected otherwise.
+    SGLANG_DSA_ALLOW_TORCH_FALLBACK = EnvBool(False)
+    # Allow an explicitly set non-DSA attention backend for a DSA model on CUDA. Such a backend runs
+    # dense MLA over the whole context and ignores the indexer and every --dsa-* option.
+    SGLANG_DSA_ALLOW_DENSE_ATTENTION = EnvBool(False)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     # Capture the verify metadata refresh inside the CUDA graph; the

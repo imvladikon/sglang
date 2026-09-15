@@ -3114,6 +3114,53 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             with override_platform(is_sm100=False):
                 self.assertEqual(_deepseek_family_overrides(_args(), None), {})
 
+    def test_deepseek_dsa_rejects_dense_attention_backend_on_cuda(self):
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
+        from sglang.srt.environ import envs
+
+        def _args(**kw):
+            defaults = dict(
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                enable_prefill_cp=False,
+                dcp_size=1,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_cuda=True, is_npu=False, is_xpu=False, is_hip=False),
+        ):
+            for field, value in (
+                ("attention_backend", "triton"),
+                ("attention_backend", "fa3"),
+                ("prefill_attention_backend", "flashinfer"),
+                ("decode_attention_backend", "triton"),
+            ):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        f"--{field.replace('_', '-')} {value} runs dense MLA",
+                    ):
+                        _deepseek_family_overrides(_args(**{field: value}), None)
+            for value in ("dsa", "nsa"):
+                with self.subTest(value=value):
+                    self.assertEqual(
+                        _deepseek_family_overrides(
+                            _args(attention_backend=value), None
+                        ),
+                        {"page_size": 64},
+                    )
+            with envs.SGLANG_DSA_ALLOW_DENSE_ATTENTION.override(True):
+                self.assertEqual(
+                    _deepseek_family_overrides(_args(attention_backend="triton"), None),
+                    {"page_size": 64},
+                )
+
     def test_qwen3_moe_family_quant_absorption(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_moe import (
             _qwen3_moe_family_overrides,

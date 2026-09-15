@@ -660,6 +660,61 @@ def _check_tilelang_dsa_fp8_kv(
     )
 
 
+def _kpool_sparse_prefill_backend(major: int) -> str:
+    """The sparse backend that actually runs a KPool (``index_kpool > 1``) model on SM90+ CUDA."""
+    return "trtllm" if major >= 10 else "fa3"
+
+
+def _resolve_kpool_sparse_prefill(
+    view: Any,
+    hf_config: Any,
+    major: int,
+    declared: Dict[str, Any],
+    user_set_prefill: bool,
+) -> None:
+    """flashmla_sparse cannot serve KPool tails; resolve to the backend that does instead of swapping it at runtime."""
+    from sglang.srt.configs.model_config import get_dsa_index_kpool
+
+    if get_dsa_index_kpool(hf_config) <= 1:
+        return
+    replacement = _kpool_sparse_prefill_backend(major)
+    if not user_set_prefill:
+        if declared.get("dsa_prefill_backend") == "flashmla_sparse":
+            declared["dsa_prefill_backend"] = replacement
+        return
+    if view.dsa_prefill_backend == "flashmla_sparse":
+        raise ValueError(
+            "--dsa-prefill-backend flashmla_sparse does not support KPool models "
+            f"(index_kpool={get_dsa_index_kpool(hf_config)}); use --dsa-prefill-backend "
+            f"{replacement} on SM{major}."
+        )
+
+
+def _check_explicit_torch_dsa_backends(view: Any, major: int) -> None:
+    """Reject an explicitly requested torch DSA path on SM90+ CUDA unless SGLANG_DSA_ALLOW_TORCH_FALLBACK=1."""
+    torch_fields = [
+        field
+        for field in (
+            "dsa_prefill_backend",
+            "dsa_decode_backend",
+            "dsa_topk_backend",
+            "dsa_paged_mqa_logits_backend",
+        )
+        if getattr(view, field, None) == "torch"
+    ]
+    if not torch_fields or envs.SGLANG_DSA_ALLOW_TORCH_FALLBACK.get():
+        return
+    options = ", ".join(
+        "--" + field.replace("_", "-") + " torch" for field in torch_fields
+    )
+    raise ValueError(
+        f"{options} selects the eager torch DSA reference path on SM{major}, which syncs with the host "
+        "on every layer and is far slower than the fused kernels. Leave these unset to use the defaults "
+        f"(sparse attention {'trtllm' if major >= 10 else 'fa3/flashmla_sparse'}, sgl-kernel top-k, "
+        "DeepGEMM MQA logits), or set SGLANG_DSA_ALLOW_TORCH_FALLBACK=1 to run it anyway."
+    )
+
+
 @register_post_process
 def _dsa_split_backend_resolution(view: Any) -> dict:
     """Slot pass in the DSA arm: default the DSA prefill/decode split
@@ -790,6 +845,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = "flashmla_sparse"
         if not user_set_decode:
             declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
+
+    if not get_platform().is_hip and major >= 9:
+        _resolve_kpool_sparse_prefill(
+            view, hf_config, major, declared, user_set_prefill
+        )
+        _check_explicit_torch_dsa_backends(view, major)
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)

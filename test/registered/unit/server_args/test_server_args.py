@@ -976,6 +976,113 @@ class TestRocmDsaTopKCompatibility(CustomTestCase):
             self.assertTrue(envs.SGLANG_DSA_FUSE_TOPK.get())
 
 
+class TestGlm53FlashDsaBackendSelection(unittest.TestCase):
+    """GLM-5.3-Flash geometry (NoPE, KPool) on CUDA: no silent torch or KPool swaps."""
+
+    @staticmethod
+    def _resolve(major=9, allow_torch=None, **kw):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _dsa_split_backend_resolution,
+        )
+
+        hf = SimpleNamespace(
+            architectures=["Glm5NextForConditionalGeneration"],
+            index_kpool=4,
+            index_topk=2048,
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+        )
+        defaults = dict(
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            dsa_topk_backend="sgl-kernel",
+            dsa_paged_mqa_logits_backend="auto",
+            enable_hisparse=False,
+        )
+        defaults.update(kw)
+        view = ResolvedView(
+            SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+        )
+        env = (
+            {}
+            if allow_torch is None
+            else {"SGLANG_DSA_ALLOW_TORCH_FALLBACK": allow_torch}
+        )
+        with (
+            patch.dict(os.environ, env),
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(major, 0)),
+        ):
+            declared = _dsa_split_backend_resolution(view)
+        return {
+            field: declared.get(field, defaults[field])
+            for field in ("dsa_prefill_backend", "dsa_decode_backend")
+        }
+
+    def test_sm90_defaults_resolve_to_the_kpool_capable_native_backend(self):
+        self.assertEqual(
+            self._resolve(),
+            {"dsa_prefill_backend": "fa3", "dsa_decode_backend": "fa3"},
+        )
+
+    def test_sm100_defaults_resolve_kpool_prefill_to_trtllm(self):
+        self.assertEqual(
+            self._resolve(major=10),
+            {"dsa_prefill_backend": "trtllm", "dsa_decode_backend": "trtllm"},
+        )
+
+    def test_explicit_fa3_is_accepted_on_sm90(self):
+        self.assertEqual(
+            self._resolve(dsa_prefill_backend="fa3", dsa_decode_backend="fa3"),
+            {"dsa_prefill_backend": "fa3", "dsa_decode_backend": "fa3"},
+        )
+
+    def test_explicit_triton_is_rejected_on_cuda(self):
+        with self.assertRaisesRegex(ValueError, "triton.*ROCm"):
+            self._resolve(dsa_prefill_backend="triton", dsa_decode_backend="triton")
+
+    def test_explicit_flashmla_sparse_is_rejected_for_kpool(self):
+        with self.assertRaisesRegex(
+            ValueError, "flashmla_sparse does not support KPool.*fa3"
+        ):
+            self._resolve(dsa_prefill_backend="flashmla_sparse")
+
+    def test_explicit_torch_is_rejected_on_sm90_without_opt_in(self):
+        for field in (
+            "dsa_prefill_backend",
+            "dsa_decode_backend",
+            "dsa_topk_backend",
+            "dsa_paged_mqa_logits_backend",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    ValueError, "eager torch DSA reference path"
+                ):
+                    self._resolve(**{field: "torch"})
+
+    def test_explicit_torch_is_allowed_with_opt_in(self):
+        self.assertEqual(
+            self._resolve(
+                allow_torch="1",
+                dsa_prefill_backend="torch",
+                dsa_decode_backend="torch",
+                dsa_topk_backend="torch",
+            ),
+            {"dsa_prefill_backend": "torch", "dsa_decode_backend": "torch"},
+        )
+
+    def test_ampere_keeps_the_torch_default(self):
+        self.assertEqual(
+            self._resolve(major=8),
+            {"dsa_prefill_backend": "torch", "dsa_decode_backend": "torch"},
+        )
+
+
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     # The backend selection moved to the resolution pipeline; these policy
     # tests drive the pass through its read-only view.

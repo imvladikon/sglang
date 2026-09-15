@@ -17,6 +17,34 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+_DSA_ATTENTION_BACKENDS = ("dsa", "nsa")
+
+
+def _check_dense_attention_for_dsa(cfg: Any) -> None:
+    """A non-DSA attention backend silently runs dense MLA for a DSA model; require an explicit opt-in."""
+    from sglang.srt.environ import envs
+
+    dense = [
+        f"--{field.replace('_', '-')} {value}"
+        for field in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        )
+        if (value := getattr(cfg, field)) is not None
+        and value not in _DSA_ATTENTION_BACKENDS
+    ]
+    if not dense or envs.SGLANG_DSA_ALLOW_DENSE_ATTENTION.get():
+        return
+    raise ValueError(
+        f"{', '.join(dense)} runs dense MLA attention for this DSA model: the indexer "
+        "top-k selection and every --dsa-* backend option are ignored, so rollout "
+        "logprobs and speed differ from sparse attention. Leave the attention backend "
+        "unset (or use --attention-backend dsa), or set "
+        "SGLANG_DSA_ALLOW_DENSE_ATTENTION=1 to run dense attention anyway."
+    )
+
+
 @_register_for(
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
@@ -87,6 +115,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"
             logger.info("Use dsa attention backend for DeepSeek with DSA.")
+        elif get_platform().is_cuda:
+            _check_dense_attention_for_dsa(cfg)
         if not get_platform().is_npu and not get_platform().is_xpu:  # CUDA or ROCm GPU
             if cfg.enable_prefill_cp:
                 logger.warning(
