@@ -690,6 +690,48 @@ def _resolve_kpool_sparse_prefill(
         )
 
 
+_DSA_KERNEL_BACKEND_FIELDS = (
+    "dsa_prefill_backend",
+    "dsa_decode_backend",
+    "dsa_topk_backend",
+    "dsa_paged_mqa_logits_backend",
+)
+
+
+def _is_compact_kpool_indexer(hf_config: Any) -> bool:
+    from sglang.srt.configs.model_config import get_dsa_index_kpool
+
+    return (
+        get_dsa_index_kpool(hf_config) > 1
+        and getattr(hf_config, "index_head_dim", 128) != 128
+    )
+
+
+def _check_compact_kpool_indexer(
+    view: Any, hf_config: Any, declared: Dict[str, Any]
+) -> None:
+    """A KPool indexer with index_head_dim != 128 runs only as the torch reference.
+
+    The paged MQA logits kernels (DeepGEMM, TileLang) hard-code a 128+4 byte key,
+    and the KPool indexer takes the torch reference only when top-k and sparse
+    attention are torch as well.
+    """
+    if not _is_compact_kpool_indexer(hf_config):
+        return
+    wrong = []
+    for field in _DSA_KERNEL_BACKEND_FIELDS:
+        value = declared.get(field, getattr(view, field, None))
+        if value != "torch":
+            wrong.append(f"--{field.replace('_', '-')} {value}")
+    if wrong:
+        raise ValueError(
+            f"This KPool model has index_head_dim={hf_config.index_head_dim}, which only the torch "
+            "reference indexer supports (the paged MQA logits kernels assume 128); it requires "
+            "--dsa-prefill-backend, --dsa-decode-backend, --dsa-topk-backend and "
+            f"--dsa-paged-mqa-logits-backend all set to torch. Got {', '.join(wrong)}."
+        )
+
+
 def _check_explicit_torch_dsa_backends(view: Any, hf_config: Any, major: int) -> None:
     """Reject an explicitly requested torch DSA path on SM90+ CUDA unless SGLANG_DSA_ALLOW_TORCH_FALLBACK=1."""
     fields = ["dsa_prefill_backend", "dsa_decode_backend", "dsa_topk_backend"]
@@ -697,7 +739,11 @@ def _check_explicit_torch_dsa_backends(view: Any, hf_config: Any, major: int) ->
     if getattr(hf_config, "index_head_dim", 128) == 128:
         fields.append("dsa_paged_mqa_logits_backend")
     torch_fields = [field for field in fields if getattr(view, field, None) == "torch"]
-    if not torch_fields or envs.SGLANG_DSA_ALLOW_TORCH_FALLBACK.get():
+    if (
+        not torch_fields
+        or _is_compact_kpool_indexer(hf_config)
+        or envs.SGLANG_DSA_ALLOW_TORCH_FALLBACK.get()
+    ):
         return
     options = ", ".join(
         "--" + field.replace("_", "-") + " torch" for field in torch_fields
@@ -845,6 +891,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         _resolve_kpool_sparse_prefill(
             view, hf_config, major, declared, user_set_prefill
         )
+        _check_compact_kpool_indexer(view, hf_config, declared)
         _check_explicit_torch_dsa_backends(view, hf_config, major)
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)

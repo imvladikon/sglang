@@ -980,7 +980,7 @@ class TestGlm53FlashDsaBackendSelection(unittest.TestCase):
     """GLM-5.3-Flash geometry (NoPE, KPool) on CUDA: no silent torch or KPool swaps."""
 
     @staticmethod
-    def _resolve(major=9, allow_torch=None, index_head_dim=128, **kw):
+    def _resolve(major=9, allow_torch=None, index_head_dim=128, index_kpool=4, **kw):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _dsa_split_backend_resolution,
@@ -988,7 +988,7 @@ class TestGlm53FlashDsaBackendSelection(unittest.TestCase):
 
         hf = SimpleNamespace(
             architectures=["Glm5NextForConditionalGeneration"],
-            index_kpool=4,
+            index_kpool=index_kpool,
             index_topk=2048,
             index_head_dim=index_head_dim,
             kv_lora_rank=512,
@@ -1068,8 +1068,31 @@ class TestGlm53FlashDsaBackendSelection(unittest.TestCase):
 
     def test_torch_mqa_logits_is_accepted_for_compact_index_head_dim(self):
         self.assertEqual(
-            self._resolve(index_head_dim=64, dsa_paged_mqa_logits_backend="torch"),
+            self._resolve(
+                index_head_dim=64,
+                index_kpool=1,
+                dsa_prefill_backend="fa3",
+                dsa_paged_mqa_logits_backend="torch",
+            ),
             {"dsa_prefill_backend": "fa3", "dsa_decode_backend": "fa3"},
+        )
+
+    def test_compact_kpool_indexer_requires_the_full_torch_reference(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "index_head_dim=64.*Got --dsa-prefill-backend fa3, --dsa-decode-backend fa3, "
+            "--dsa-topk-backend sgl-kernel\\.$",
+        ):
+            self._resolve(index_head_dim=64, dsa_paged_mqa_logits_backend="torch")
+        self.assertEqual(
+            self._resolve(
+                index_head_dim=64,
+                dsa_prefill_backend="torch",
+                dsa_decode_backend="torch",
+                dsa_topk_backend="torch",
+                dsa_paged_mqa_logits_backend="torch",
+            ),
+            {"dsa_prefill_backend": "torch", "dsa_decode_backend": "torch"},
         )
 
     def test_explicit_torch_is_allowed_with_opt_in(self):
