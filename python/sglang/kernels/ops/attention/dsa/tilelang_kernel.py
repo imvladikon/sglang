@@ -1512,6 +1512,19 @@ def tilelang_fp8_paged_mqa_logits(
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
+    # TileLang's GEMM splits the head axis into warps of 8 and rejects other head
+    # counts (e.g. Flash-8B's 4 indexer heads). A padded head has a zero query and
+    # a zero weight, so it adds exactly nothing to the logits.
+    padded_heads = -(-num_heads // 8) * 8
+    if padded_heads != num_heads:
+        pad = padded_heads - num_heads
+        q_u8 = q_fp8.view(torch.uint8)
+        q_fp8 = torch.cat(
+            [q_u8, q_u8.new_zeros(batch_size, 1, pad, head_dim)], dim=2
+        ).view(q_fp8.dtype)
+        weight = torch.cat([weight, weight.new_zeros(batch_size, pad)], dim=1)
+        num_heads = padded_heads
+
     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
 
     NUM_CU = 256
