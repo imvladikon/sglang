@@ -690,18 +690,13 @@ def _resolve_kpool_sparse_prefill(
         )
 
 
-def _check_explicit_torch_dsa_backends(view: Any, major: int) -> None:
+def _check_explicit_torch_dsa_backends(view: Any, hf_config: Any, major: int) -> None:
     """Reject an explicitly requested torch DSA path on SM90+ CUDA unless SGLANG_DSA_ALLOW_TORCH_FALLBACK=1."""
-    torch_fields = [
-        field
-        for field in (
-            "dsa_prefill_backend",
-            "dsa_decode_backend",
-            "dsa_topk_backend",
-            "dsa_paged_mqa_logits_backend",
-        )
-        if getattr(view, field, None) == "torch"
-    ]
+    fields = ["dsa_prefill_backend", "dsa_decode_backend", "dsa_topk_backend"]
+    # Optimized indexer kernels need index_head_dim=128; for compact 64 torch is the only MQA logits path.
+    if getattr(hf_config, "index_head_dim", 128) == 128:
+        fields.append("dsa_paged_mqa_logits_backend")
+    torch_fields = [field for field in fields if getattr(view, field, None) == "torch"]
     if not torch_fields or envs.SGLANG_DSA_ALLOW_TORCH_FALLBACK.get():
         return
     options = ", ".join(
@@ -850,7 +845,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         _resolve_kpool_sparse_prefill(
             view, hf_config, major, declared, user_set_prefill
         )
-        _check_explicit_torch_dsa_backends(view, major)
+        _check_explicit_torch_dsa_backends(view, hf_config, major)
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)

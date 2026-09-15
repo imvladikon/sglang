@@ -980,7 +980,7 @@ class TestGlm53FlashDsaBackendSelection(unittest.TestCase):
     """GLM-5.3-Flash geometry (NoPE, KPool) on CUDA: no silent torch or KPool swaps."""
 
     @staticmethod
-    def _resolve(major=9, allow_torch=None, **kw):
+    def _resolve(major=9, allow_torch=None, index_head_dim=128, **kw):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _dsa_split_backend_resolution,
@@ -990,6 +990,7 @@ class TestGlm53FlashDsaBackendSelection(unittest.TestCase):
             architectures=["Glm5NextForConditionalGeneration"],
             index_kpool=4,
             index_topk=2048,
+            index_head_dim=index_head_dim,
             kv_lora_rank=512,
             qk_rope_head_dim=0,
         )
@@ -1064,6 +1065,12 @@ class TestGlm53FlashDsaBackendSelection(unittest.TestCase):
                     ValueError, "eager torch DSA reference path"
                 ):
                     self._resolve(**{field: "torch"})
+
+    def test_torch_mqa_logits_is_accepted_for_compact_index_head_dim(self):
+        self.assertEqual(
+            self._resolve(index_head_dim=64, dsa_paged_mqa_logits_backend="torch"),
+            {"dsa_prefill_backend": "fa3", "dsa_decode_backend": "fa3"},
+        )
 
     def test_explicit_torch_is_allowed_with_opt_in(self):
         self.assertEqual(
