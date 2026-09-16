@@ -131,6 +131,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.metrics_reporter.enable_metrics = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
@@ -185,6 +186,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
@@ -305,6 +307,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
+        scheduler.enable_lora = False
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler

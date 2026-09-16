@@ -173,16 +173,18 @@ REASONING_MODE_RULES = (
         # toggle GLM-5.2 had is gone from their templates. Without a mode rule
         # their reasoning config stays None, they drop out of the GLM family
         # checks and end up on a tool parser that cannot read their calls.
-        name="glm_always_on_reasoning",
+        name="glm53_always_think",
         value=ReasoningToggleConfig(special_case="always"),
         # Keep the fork's older template signature and recognize the explicit
         # GLM-5.3 effort/tool signature added upstream, including templates that
         # open <think> in the prompt without a literal closing tag.
-        predicate=lambda ctx: _is_glm53(ctx)
-        or (
-            ctx.has_text("[gMASK]<sop>")
-            and ctx.has_text("</think>")
-            and not ctx.has_text("enable_thinking")
+        predicate=lambda ctx: (
+            _is_glm53(ctx)
+            or (
+                ctx.has_text("[gMASK]<sop>")
+                and ctx.has_text("</think>")
+                and not ctx.has_text("enable_thinking")
+            )
         ),
     ),
     DetectionRule(

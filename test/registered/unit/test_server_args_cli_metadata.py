@@ -45,6 +45,11 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
             self.actions_by_option["--prefill-delayer-forward-passes-buckets"].nargs,
             "+",
         )
+        self.assertIs(
+            self.actions_by_option["--cuda-graph-prefill-max-context"].type,
+            human_readable_int,
+        )
+        self.assertIsNone(self.actions_by_option["--context-bucket"].nargs)
         self.assertEqual(
             self.actions_by_option["--schedule-policy"].choices,
             [
@@ -101,6 +106,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 self.assertEqual(server_args.dsa_prefill_backend, "torch")
                 self.assertEqual(server_args.dsa_decode_backend, "torch")
                 self.assertEqual(server_args.dsa_topk_backend, "torch")
+
     def test_dsa_fallback_backends_survive_field_migration(self):
         for backend in ("torch", "triton"):
             for prefix in ("dsa", "nsa"):
@@ -127,6 +133,19 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                     self.assertEqual(server_args.dsa_prefill_backend, backend)
                     self.assertEqual(server_args.dsa_decode_backend, backend)
                     self.assertEqual(server_args.dsa_paged_mqa_logits_backend, backend)
+
+    def test_prefill_max_context_accepts_human_readable_values(self):
+        for option in (
+            "--cuda-graph-prefill-max-context",
+            "--context-bucket",
+        ):
+            with self.subTest(option=option):
+                args = self.parser.parse_args(["--model", "dummy", option, "200k"])
+
+                self.assertEqual(
+                    ServerArgs.from_cli_args(args).cuda_graph_prefill_max_context,
+                    200_000,
+                )
 
     def test_migrated_and_manual_options_parse_together(self):
         args = self.parser.parse_args(
