@@ -148,3 +148,9 @@ def validate_mamba_no_buffer(view, model_arch: str):
     assert view.attention_backend != "trtllm_mha", (
         "no_buffer do not support trtllm_mha attention backend."
     )
+    # Operators read this in run logs as a config choice of theirs; it is the model's.
+    logger.warning(
+        "Overlap schedule is off for %s: its linear-attention cache runs in no_buffer mode, "
+        "which has no overlap-safe state handling. This is a model requirement, not a tuning knob.",
+        model_arch,
+    )
