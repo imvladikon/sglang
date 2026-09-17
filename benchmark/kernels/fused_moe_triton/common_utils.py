@@ -120,6 +120,7 @@ def get_model_config(
                 "DeepseekV32ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
+                "Glm5NextForConditionalGeneration",
                 "GlmMoeDsaForCausalLM",
                 "MistralLarge3ForCausalLM",
             ]
