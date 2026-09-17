@@ -619,6 +619,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
         self.last_receive_tstamp = real_time()
+        self.last_generation_tstamp = real_time()
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
@@ -2255,6 +2256,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
             ):
                 await self._handle_batch_output(recv_obj)
+                # Only generation output moves this one. `last_receive_tstamp` below is bumped by
+                # every message the scheduler sends, including the control traffic a scheduler
+                # keeps answering while its collective is hung -- so a caller that wants to know
+                # whether the model is still producing tokens cannot use it.
+                self.last_generation_tstamp = real_time()
             else:
                 self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
