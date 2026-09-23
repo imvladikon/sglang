@@ -63,6 +63,33 @@ def test_nope_mha_k_rocm_skips_empty_rope_tail(k_pe):
     )
 
     torch.testing.assert_close(out, k_nope)
+
+
+def _run_nope_concat_rocm(backend: str, k_pe: torch.Tensor | None):
+    # qk_head_dim / qk_nope_head_dim are the roped-model values so that the
+    # concat branch would be entered (and fail on the zero-width tail) if the
+    # qk_rope_head_dim == 0 guard were missing.
+    fake_self = SimpleNamespace(
+        qk_rope_head_dim=0,
+        qk_nope_head_dim=128,
+        qk_head_dim=128,
+        num_local_heads=2,
+        current_attention_backend=backend,
+    )
+    return forward_mha_rocm.DeepseekMHARocmForwardMixin._concat_and_cast_mha_k_rocm(
+        fake_self,
+        torch.randn(4, 2, 128, dtype=torch.bfloat16),
+        k_pe,
+    )
+
+
+@pytest.mark.parametrize("backend", ["aiter", "triton"])
+@pytest.mark.parametrize("zero_width_k_pe", [False, True])
+def test_nope_mha_k_cast_rocm(backend, zero_width_k_pe):
+    k_pe = torch.randn(4, 1, 0, dtype=torch.bfloat16) if zero_width_k_pe else None
+    out = _run_nope_concat_rocm(backend, k_pe)
+    assert out.shape == (4, 2, 128)
+    assert out.dtype == torch.bfloat16
     assert out.is_contiguous()
 
 

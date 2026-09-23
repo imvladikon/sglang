@@ -129,27 +129,34 @@ def transform_index_page_table_decode_tiled_kernel(
     TOPK: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ):
+    """Width-generic form of the kernel above.
+
+    The 2048 variant folds the row stride into a compile-time TOPK and covers a
+    whole row with one unmasked `tl.arange`, which needs TOPK to be a power of
+    two. k-pool widths are not: `index_topk + index_kpool - 1` is 2051 for
+    GLM-5.3-Flash. Tile the row instead and carry the strides explicitly.
+    """
     req_id = tl.program_id(0)
     topk_offsets = tl.program_id(1) * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
-    mask = topk_offsets < TOPK
+    in_row = topk_offsets < TOPK
 
     loaded_topk_indices = tl.load(
         topk_indices_ptr
         + req_id * topk_indices_stride_0
         + topk_offsets * topk_indices_stride_1,
-        mask=mask,
+        mask=in_row,
         other=-1,
     )
-    valid_topk_mask = mask & (loaded_topk_indices >= 0)
+    selected = in_row & (loaded_topk_indices >= 0)
     loaded_kv_indices = tl.load(
         page_table_ptr + req_id * page_table_row_stride + loaded_topk_indices,
-        mask=valid_topk_mask,
+        mask=selected,
         other=-1,
     )
     tl.store(
         result_ptr + req_id * result_stride_0 + topk_offsets * result_stride_1,
         loaded_kv_indices,
-        mask=mask,
+        mask=in_row,
     )
 
 
@@ -232,11 +239,12 @@ def transform_index_page_table_decode_fast(
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
     qo_len = topk_indices.shape[0]
+    topk = topk_indices.shape[1]
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
-    topk = topk_indices.shape[1]
     if topk == 2048:
-        # Keep the 2048-wide fast path; KPool tail widths use the tiled kernel.
+        # Keep the single-program path for the unpooled width, which covers a
+        # whole row per program with no masking.
         transform_index_page_table_decode_kernel[(qo_len,)](
             page_table,
             topk_indices,
@@ -244,23 +252,24 @@ def transform_index_page_table_decode_fast(
             page_size,
             page_table_row_stride=page_table.stride(0),
         )
-    else:
-        block_topk = 256
-        transform_index_page_table_decode_tiled_kernel[
-            (qo_len, triton.cdiv(topk, block_topk))
-        ](
-            page_table,
-            topk_indices,
-            result,
-            page_table.stride(0),
-            topk_indices.stride(0),
-            topk_indices.stride(1),
-            result.stride(0),
-            result.stride(1),
-            TOPK=topk,
-            BLOCK_TOPK=block_topk,
-            num_warps=4,
-        )
+        return result
+
+    block_topk = 256
+    transform_index_page_table_decode_tiled_kernel[
+        (qo_len, triton.cdiv(topk, block_topk))
+    ](
+        page_table,
+        topk_indices,
+        result,
+        page_table.stride(0),
+        topk_indices.stride(0),
+        topk_indices.stride(1),
+        result.stride(0),
+        result.stride(1),
+        TOPK=topk,
+        BLOCK_TOPK=block_topk,
+        num_warps=4,
+    )
     return result
 
 
@@ -274,6 +283,8 @@ def transform_index_page_table_prefill_fast(
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert page_size == 1
+    assert topk_indices.ndim == 2
+    assert topk_indices.shape[1] > 0
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:

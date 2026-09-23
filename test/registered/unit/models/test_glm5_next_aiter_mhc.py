@@ -196,7 +196,7 @@ def test_mhc_state_uses_optional_fused_attention_to_mlp_boundary():
         hc_attn_pre=MagicMock(),
         hc_ffn_pre=MagicMock(side_effect=AssertionError("unfused pre called")),
         hc_post=MagicMock(side_effect=AssertionError("unfused post called")),
-        hc_attn_to_mlp=fused,
+        hc_ffn_post_pre=fused,
         h_res=initial_h_res,
         h_post=initial_h_post,
     )
@@ -211,19 +211,20 @@ def test_mhc_state_uses_optional_fused_attention_to_mlp_boundary():
     assert state.h_res is next_h_res
     assert state.h_post is next_h_post
     fused.assert_called_once()
-    call_args = fused.call_args.args
-    assert call_args[0] is hidden_states
-    assert call_args[1] is residual
-    assert call_args[2] is initial_h_res
-    assert call_args[3] is initial_h_post
-    torch.testing.assert_close(call_args[4], norm.weight)
-    assert call_args[5] == norm.variance_epsilon
+    call_kwargs = fused.call_args.kwargs
+    assert call_kwargs["hidden_states"] is hidden_states
+    assert call_kwargs["residual"] is residual
+    assert call_kwargs["h_res"] is initial_h_res
+    assert call_kwargs["h_post"] is initial_h_post
+    torch.testing.assert_close(call_kwargs["out_norm_weight"], norm.weight)
+    assert call_kwargs["out_norm_eps"] == norm.variance_epsilon
 
 
 def test_glm_aiter_mhc_boundary_preserves_communicator_shapes():
     layer = Glm5NextDecoderLayer.__new__(Glm5NextDecoderLayer)
     nn.Module.__init__(layer)
     layer.config = SimpleNamespace(
+        mhc=True,
         hc_mult=4,
         rms_norm_eps=1e-6,
         hc_eps=1e-5,
@@ -242,26 +243,24 @@ def test_glm_aiter_mhc_boundary_preserves_communicator_shapes():
     next_h_post = torch.randn(2, 4)
     next_h_res = torch.randn(2, 4, 4)
 
-    with (
-        patch(
-            "sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc.apply_mhc_post_pre_boundary",
-            return_value=(
-                next_residual,
-                next_hidden_states,
-                next_h_post,
-                next_h_res,
-                True,
-            ),
-        ) as fused,
-        patch.object(glm5_next, "_GLM_AITER_FUSED_MHC_LOGGED", False),
-    ):
-        actual = layer.hc_attn_to_mlp(
-            hidden_states,
-            residual,
-            h_res,
-            h_post,
-            torch.ones(8),
-            1e-6,
+    with patch.object(
+        glm5_next,
+        "apply_mhc_post_pre_boundary",
+        return_value=(
+            next_residual,
+            next_hidden_states,
+            next_h_post,
+            next_h_res,
+            True,
+        ),
+    ) as fused:
+        actual = layer.hc_ffn_post_pre(
+            hidden_states=hidden_states,
+            residual=residual,
+            h_res=h_res,
+            h_post=h_post,
+            out_norm_weight=torch.ones(8),
+            out_norm_eps=1e-6,
         )
 
     actual_hidden, actual_residual, actual_h_res, actual_h_post, norm_fused = actual

@@ -19,7 +19,7 @@ from sglang.srt.lora.utils import (
 from sglang.srt.models.glm5_next import (
     Glm5NextDecoderLayer,
     Glm5NextForConditionalGeneration,
-    _can_fuse_kda_projections,
+    Glm5NextLinearAttention,
 )
 from sglang.srt.utils.common import SUPPORTED_LORA_TARGET_MODULES
 
@@ -161,19 +161,24 @@ def test_kda_gate_names_do_not_leak_into_other_models_all_target():
 
 
 def test_lora_disables_the_unquantized_fused_kda_layout():
-    with patch(
-        "sglang.srt.models.glm5_next.get_lora",
-        return_value=SimpleNamespace(enable_lora=True),
+    def can_fuse(quant_config):
+        return Glm5NextLinearAttention._can_fuse_proj(
+            quant_config, "", "fused_qkvbfg_a_proj", "fused_fg_b_proj"
+        )
+
+    for lora in (
+        SimpleNamespace(enable_lora=True, lora_paths=None),
+        SimpleNamespace(enable_lora=False, lora_paths={"adapter": "/tmp/adapter"}),
     ):
-        assert not _can_fuse_kda_projections(None, 2, 2)
+        with patch("sglang.srt.models.glm5_next.get_lora", return_value=lora):
+            assert not can_fuse(None)
 
     with patch(
         "sglang.srt.models.glm5_next.get_lora",
-        return_value=SimpleNamespace(enable_lora=False),
+        return_value=SimpleNamespace(enable_lora=False, lora_paths=None),
     ):
-        assert _can_fuse_kda_projections(None, 2, 2)
-        assert not _can_fuse_kda_projections(None, 1, 2)
-        assert not _can_fuse_kda_projections(object(), 2, 2)
+        assert can_fuse(None)
+        assert not can_fuse(SimpleNamespace(get_name=lambda: "awq"))
 
 
 def test_indexer_lora_checks_fusion_on_the_instantiated_modules():

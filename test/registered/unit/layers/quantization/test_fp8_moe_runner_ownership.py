@@ -7,6 +7,7 @@ for weight loading without giving it a runner (issue #36264).
 """
 
 import sys
+import types
 import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -16,11 +17,13 @@ import torch
 # Register FP8 before importing the FlashInfer runner to avoid the
 # flashinfer_trtllm <-> fp8 module cycle during isolated test collection.
 import sglang.srt.layers.quantization.fp8  # noqa: F401
+from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     align_fp8_moe_weights_for_flashinfer_trtllm,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization import fp8 as fp8_module
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -272,6 +275,50 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         self.assertIs(layer.w2_weight, original_w2)
         self.assertIs(layer.w13_weight.weight_loader, loader)
         self.assertIs(layer.w2_weight.weight_loader, loader)
+
+
+class TestFp8MoEAiterQuantInfo(CustomTestCase):
+    """maybe_get_hip_aiter_quant_info assembles what the AITER runner consumes.
+
+    The gfx950 e2e builds AiterMoeQuantInfo by hand, so dropping the gate/up
+    layout or the clamp here would leave it passing while served experts read
+    the gate and up halves swapped.
+    """
+
+    def test_block_fp8_forwards_separated_layout_and_clamp(self):
+        method = Fp8MoEMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+        )
+        # create_moe_runner is not called: it resolves a global backend and
+        # builds a MoeRunner, none of which this assembly reads.
+        method.moe_runner_config = MoeRunnerConfig(swiglu_limit=10.0)
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros((1, 4, 4), dtype=torch.float8_e4m3fn),
+            w2_weight=torch.zeros((1, 4, 2), dtype=torch.float8_e4m3fn),
+            w13_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.float32),
+            w2_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.float32),
+            hidden_pad=0,
+            intermediate_pad=0,
+            _aiter_gate_up_interleaved=False,
+            dispatcher=SimpleNamespace(expert_mask_gpu=torch.tensor([True, False])),
+        )
+        fake_moe_common = types.ModuleType("aiter.ops.flydsl.moe_common")
+        fake_moe_common.GateMode = SimpleNamespace(
+            SEPARATED=SimpleNamespace(value="separated"),
+            INTERLEAVE=SimpleNamespace(value="interleave"),
+        )
+
+        with (
+            patch.dict(sys.modules, {"aiter.ops.flydsl.moe_common": fake_moe_common}),
+            patch.object(fp8_module, "_use_aiter", True),
+        ):
+            quant_info = method.maybe_get_hip_aiter_quant_info(layer)
+
+        self.assertIsNotNone(quant_info)
+        self.assertEqual(quant_info.quant_type, AiterQuantType.PER_128X128)
+        self.assertEqual(quant_info.swiglu_limit, 10.0)
+        self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "separated"})
+        self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
 
 
 if __name__ == "__main__":
