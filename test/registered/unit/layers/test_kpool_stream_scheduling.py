@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsa import triton_kernel
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as indexer_module
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -215,7 +216,8 @@ class TestKPoolStreamScheduling(unittest.TestCase):
         metadata = SimpleNamespace(
             attn_metadata=SimpleNamespace(
                 kpool_extend_plan=object() if has_plan else None
-            )
+            ),
+            topk_backend=DSATopKBackend.SGL_KERNEL,
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,

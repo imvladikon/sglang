@@ -67,6 +67,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+def _dsa_reference_backend(mode) -> str:
+    kernel = get_exec().kernel
+    if mode.is_extend_without_speculative():
+        return kernel.dsa_prefill_backend
+    return kernel.dsa_decode_backend
+
+
 def _should_fuse_kpool_topk(metadata: BaseIndexerMetadata) -> bool:
     return envs.SGLANG_DSA_FUSE_TOPK.get() and not getattr(
         metadata, "force_unfused_topk", False
@@ -1747,12 +1754,7 @@ class IndexerKPool(MultiPlatformOp):
                 device=x.device,
             )
 
-        reference_attention_backend = (
-            get_exec().kernel.dsa_prefill_backend
-            if mode.is_extend_without_speculative()
-            else get_exec().kernel.dsa_decode_backend
-        )
-        if metadata.topk_backend.is_torch() and reference_attention_backend == "torch":
+        if metadata.topk_backend.is_torch() and _dsa_reference_backend(mode) == "torch":
             return self._forward_cuda_torch_reference(
                 x=x,
                 q_lora=q_lora,

@@ -297,7 +297,13 @@ class TestKPoolMqaBackend(CustomTestCase):
         module = ModuleType("aiter.ops.triton.fp8_mqa_logits")
         module.fp8_mqa_logits = aiter_impl
 
-        args = tuple(object() for _ in range(6))
+        # The ROCm path reads the two operand sizes to decide whether the
+        # aiter chunking workaround applies; these are far below its budget,
+        # so the call must still pass straight through.
+        args = (
+            torch.zeros(2, 4),
+            torch.zeros(3, 4),
+        ) + tuple(object() for _ in range(4))
         with (
             patch.object(dsa_indexer_kpool, "is_hip", return_value=True),
             patch.dict(
