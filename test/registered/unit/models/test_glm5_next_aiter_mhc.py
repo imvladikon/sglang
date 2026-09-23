@@ -32,26 +32,28 @@ def _fake_aiter_mhc_module(*, mhc_pre=None, mhc_post=None):
 
 
 def test_aiter_mhc_gate_is_rocm_gfx95_only():
-    with (
-        patch.object(mhc, "is_hip", return_value=True),
-        patch.object(mhc, "is_gfx95_supported", return_value=True),
-        patch.object(mhc, "get_bool_env_var", return_value=True),
-        patch.object(mhc, "_AITER_MHC_RUNTIME_DISABLED", False),
-    ):
-        assert mhc._use_aiter_mhc()
+    from sglang.srt.environ import envs
 
-    for is_hip, is_gfx95, use_aiter in (
-        (False, True, True),
-        (True, False, True),
-        (True, True, False),
+    # is_gfx95_supported() is already False on every non-HIP build, so the gate
+    # carries no is_hip() of its own.
+    for is_gfx95, use_aiter, expected in (
+        (True, True, True),
+        (False, True, False),
+        (True, False, False),
     ):
         with (
-            patch.object(mhc, "is_hip", return_value=is_hip),
             patch.object(mhc, "is_gfx95_supported", return_value=is_gfx95),
-            patch.object(mhc, "get_bool_env_var", return_value=use_aiter),
+            envs.SGLANG_USE_AITER.override(use_aiter),
             patch.object(mhc, "_AITER_MHC_RUNTIME_DISABLED", False),
         ):
-            assert not mhc._use_aiter_mhc()
+            assert mhc._use_aiter_mhc() is expected
+
+    with (
+        patch.object(mhc, "is_gfx95_supported", return_value=True),
+        envs.SGLANG_USE_AITER.override(True),
+        patch.object(mhc, "_AITER_MHC_RUNTIME_DISABLED", True),
+    ):
+        assert not mhc._use_aiter_mhc()
 
 
 def test_aiter_mhc_pre_dispatch_forwards_norm_contract():
